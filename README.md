@@ -154,6 +154,24 @@ warning at start-up and accepts unsigned payloads.
 
 `GET /healthz` reports status, version and queue depth.
 
+## systemd
+
+On a Linux server, deploy the bot as `lower.service`:
+
+```bash
+make run
+make status
+journalctl -u lower.service -f
+```
+
+`make build` compiles `./cmd` into `./bin/lower` and generates a local
+`lower.service` from the current project directory. The service sets
+`WorkingDirectory` to this directory and passes `ENV_FILE=<project>/.env`, so
+the existing config loader keeps using the same `.env` file behavior.
+
+The Makefile refuses to overwrite `/etc/systemd/system/lower.service` unless it
+contains this project's safety marker.
+
 ## Testing
 
 ```bash
