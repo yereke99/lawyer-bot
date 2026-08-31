@@ -41,7 +41,8 @@ type Pipeline struct {
 	triggers *TriggerSet
 	log      *zap.Logger
 
-	cfg PipelineConfig
+	order *chatSequencer
+	cfg   PipelineConfig
 }
 
 // PipelineConfig holds the tunables the pipeline needs.
@@ -51,6 +52,8 @@ type PipelineConfig struct {
 	NotifyRecipient string
 	DefaultSource   string
 	DryRun          bool
+	ReplyDelayMin   time.Duration
+	ReplyDelayMax   time.Duration
 }
 
 // PipelineDeps groups the pipeline's collaborators.
@@ -79,6 +82,7 @@ func NewPipeline(deps PipelineDeps, cfg PipelineConfig) *Pipeline {
 	if cfg.ContextMessages < 0 {
 		cfg.ContextMessages = 0
 	}
+	cfg.ReplyDelayMin, cfg.ReplyDelayMax = normalizeReplyDelayRange(cfg.ReplyDelayMin, cfg.ReplyDelayMax)
 	return &Pipeline{
 		users:    deps.Users,
 		messages: deps.Messages,
@@ -93,6 +97,7 @@ func NewPipeline(deps PipelineDeps, cfg PipelineConfig) *Pipeline {
 		qualify:  deps.Qualify,
 		triggers: deps.Triggers,
 		log:      deps.Logger,
+		order:    newChatSequencer(),
 		cfg:      cfg,
 	}
 }
@@ -122,7 +127,6 @@ func (p *Pipeline) Handle(ctx context.Context, in domain.InboundMessage) error {
 		logger.Phone("phone", in.PhoneNumber),
 	)
 
-	// ------------------------------------------------------ 1. deduplication
 	duplicate, err := p.messages.ExistsByWhatsAppID(ctx, in.WhatsAppMessageID)
 	if err != nil {
 		p.event(ctx, domain.TraceEvent{TraceID: in.TraceID, Stage: domain.StagePipelineError,
@@ -136,7 +140,30 @@ func (p *Pipeline) Handle(ctx context.Context, in domain.InboundMessage) error {
 		return nil
 	}
 
-	// ------------------------------------------------------ 2. identify user
+	unlock, err := p.order.Lock(ctx, inboundOrderKey(in))
+	if err != nil {
+		p.event(ctx, domain.TraceEvent{TraceID: in.TraceID, Stage: domain.StagePipelineError,
+			Decision: domain.DecisionError, Reason: "chat_order_wait_cancelled", Detail: errDetail(err)})
+		return err
+	}
+	defer unlock()
+
+	// Re-check after acquiring chat order: a duplicate can race between the
+	// fast check above and the first delivery storing the incoming message.
+	duplicate, err = p.messages.ExistsByWhatsAppID(ctx, in.WhatsAppMessageID)
+	if err != nil {
+		p.event(ctx, domain.TraceEvent{TraceID: in.TraceID, Stage: domain.StagePipelineError,
+			Decision: domain.DecisionError, Reason: "duplicate_check_failed", Detail: errDetail(err)})
+		return fmt.Errorf("duplicate check: %w", err)
+	}
+	if duplicate {
+		p.event(ctx, domain.TraceEvent{TraceID: in.TraceID, Stage: domain.StageDuplicate,
+			Decision: domain.DecisionSilent, Reason: "message already processed"})
+		log.Info("duplicate webhook delivery ignored")
+		return nil
+	}
+
+	// ------------------------------------------------------ 1. identify user
 	phone, _ := NormalizePhone(in.PhoneNumber)
 	user, err := p.users.Upsert(ctx, in.WhatsAppUserID, phone, in.DisplayName)
 	if err != nil {
@@ -153,7 +180,7 @@ func (p *Pipeline) Handle(ctx context.Context, in domain.InboundMessage) error {
 			"service":  user.DetectedService,
 		})})
 
-	// ---------------------------------------------------- 3. store the message
+	// ---------------------------------------------------- 2. store the message
 	msg := &domain.Message{
 		UserID:            user.ID,
 		WhatsAppMessageID: in.WhatsAppMessageID,
@@ -166,6 +193,13 @@ func (p *Pipeline) Handle(ctx context.Context, in domain.InboundMessage) error {
 		CreatedAt:         in.Timestamp,
 	}
 	messageID, err := p.messages.Create(ctx, msg)
+	if errors.Is(err, repository.ErrDuplicateWhatsAppMessage) {
+		p.event(ctx, domain.TraceEvent{TraceID: in.TraceID, UserID: user.ID,
+			Stage: domain.StageDuplicate, Decision: domain.DecisionSilent,
+			Reason: "message already processed"})
+		log.Info("duplicate webhook delivery ignored")
+		return nil
+	}
 	if err != nil {
 		p.event(ctx, domain.TraceEvent{TraceID: in.TraceID, UserID: user.ID,
 			Stage: domain.StagePipelineError, Decision: domain.DecisionError,
@@ -308,14 +342,19 @@ func (p *Pipeline) Handle(ctx context.Context, in domain.InboundMessage) error {
 		Reason: string(decision.Action),
 		Detail: repository.Detail(map[string]any{"language": string(lang), "chars": len(text)})})
 
+	// Persist conversation progress before the delayed outbound send. The
+	// per-chat sequencer around Handle keeps later messages in this chat from
+	// observing or sending out of order while this reply is waiting.
+	p.advanceState(ctx, log, user, decision, messageID, in.TraceID)
+	p.recordReplyFacts(ctx, log, user.ID, decision, messageID)
+
 	if err := p.send(ctx, log, user, messageID, in.TraceID, text); err != nil {
 		// A failed send must not lose the lead: the qualification below still runs.
 		log.Error("reply delivery failed", zap.Error(err))
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return err
+		}
 	}
-
-	// ---------------------------------------------- 9. advance the state machine
-	p.advanceState(ctx, log, user, decision, messageID, in.TraceID)
-	p.recordReplyFacts(ctx, log, user.ID, decision, messageID)
 
 	// ------------------------------------------------------- 10. qualify lead
 	p.qualifyLead(ctx, log, user, classification, decision, gateResult, in, lang, facts)
@@ -443,6 +482,19 @@ func (p *Pipeline) send(ctx context.Context, log *zap.Logger, user *domain.User,
 			Status: domain.DeliverySent, Attempts: 0, ProviderMessageID: "dry-run",
 		})
 		return nil
+	}
+
+	if err := p.waitBeforeReply(ctx, log, user.ID, outgoingID, traceID); err != nil {
+		delivery := domain.Delivery{
+			UserID: user.ID, MessageID: outgoingID, TraceID: traceID,
+			Recipient: user.WhatsAppUserID, Kind: domain.DeliveryKindReply,
+			Status: domain.DeliveryFailed, Attempts: 0, Error: err.Error(),
+		}
+		p.recordDelivery(ctx, log, delivery)
+		p.event(ctx, domain.TraceEvent{TraceID: traceID, UserID: user.ID, MessageID: outgoingID,
+			Stage: domain.StageReplyFailed, Decision: domain.DecisionError,
+			Reason: "reply delay cancelled", Detail: errDetail(err)})
+		return err
 	}
 
 	res, sendErr := p.wa.SendText(ctx, user.WhatsAppUserID, text)

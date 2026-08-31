@@ -19,9 +19,9 @@ Three rules are enforced by the architecture, not just by the prompt:
 ## Pipeline
 
 ```
-webhook -> store -> gate -> classify -> decide -> reply -> qualify -> notify
-             |        |         |          |        |         |         |
-          always   free     OpenAI     Go rules  template   rules   to Diana
+webhook -> store -> gate -> classify -> decide -> reply delay -> reply -> qualify -> notify
+             |        |         |          |          |          |         |
+          always   free     OpenAI     Go rules    timer    template   to Diana
 ```
 
 The **gate** (`internal/service/gate.go`) is the token budget guard. It runs
@@ -136,6 +136,17 @@ go run ./cmd              # http server on :8080
 Set `DRY_RUN=true` to run the entire pipeline — storage, classification,
 decisions, tracing — without sending a single WhatsApp message.
 
+Automatic customer replies wait for a randomized, human-like delay before the
+WhatsApp send. Configure it with:
+
+```env
+WHATSAPP_BOT_REPLY_DELAY_MIN_MS=1500
+WHATSAPP_BOT_REPLY_DELAY_MAX_MS=3000
+```
+
+The webhook is still acknowledged immediately; only the outgoing automatic bot
+reply is delayed. Lead notifications to Diana are sent without this pacing.
+
 Point the Meta webhook at `https://<host>/webhook/whatsapp` and use
 `WHATSAPP_VERIFY_TOKEN` for the subscription challenge. Set
 `WHATSAPP_APP_SECRET` so signatures are verified; without it the bot logs a
@@ -167,3 +178,5 @@ signature verification and the end-to-end pipeline including the Diana handoff.
 - A panic inside one message is recovered by the worker and never stops the bot.
 - Retried webhooks are deduplicated by `whatsapp_message_id`, so a customer is
   never answered twice.
+- Per-chat processing is sequenced, so a delayed reply in one chat does not
+  reorder that customer's bot messages or block unrelated chats.

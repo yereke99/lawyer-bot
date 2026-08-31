@@ -8,7 +8,14 @@ import (
 	"time"
 
 	"lawyer-bot/internal/domain"
+
+	"modernc.org/sqlite"
+	sqlite3 "modernc.org/sqlite/lib"
 )
+
+// ErrDuplicateWhatsAppMessage is returned when a provider retry races with the
+// normal duplicate check and hits the unique provider-message index.
+var ErrDuplicateWhatsAppMessage = errors.New("duplicate whatsapp message")
 
 // MessageRepository persists every message in both directions.
 type MessageRepository struct {
@@ -39,6 +46,9 @@ func (r *MessageRepository) Create(ctx context.Context, m *domain.Message) (int6
 		boolToInt(m.AIProcessed), m.AIIntent, m.AIConfidence,
 		boolToInt(m.BotResponded), m.CreatedAt)
 	if err != nil {
+		if m.WhatsAppMessageID != "" && isUniqueConstraint(err) {
+			return 0, fmt.Errorf("%w: %s", ErrDuplicateWhatsAppMessage, m.WhatsAppMessageID)
+		}
 		return 0, fmt.Errorf("insert message: %w", err)
 	}
 	id, err := res.LastInsertId()
@@ -169,4 +179,9 @@ func scanMessage(rows *sql.Rows) (domain.Message, error) {
 	m.AIProcessed = aiProcessed != 0
 	m.BotResponded = botResponded != 0
 	return m, nil
+}
+
+func isUniqueConstraint(err error) bool {
+	var sqliteErr *sqlite.Error
+	return errors.As(err, &sqliteErr) && sqliteErr.Code() == sqlite3.SQLITE_CONSTRAINT_UNIQUE
 }

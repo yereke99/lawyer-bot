@@ -115,14 +115,17 @@ func run() error {
 		NotifyRecipient: cfg.NotificationRecipient(),
 		DefaultSource:   cfg.DefaultLeadSrc,
 		DryRun:          cfg.DryRun,
+		ReplyDelayMin:   cfg.WhatsAppReplyDelayMin,
+		ReplyDelayMax:   cfg.WhatsAppReplyDelayMax,
 	})
 
 	// --------------------------------------------------------- worker pool
 	pool := worker.New(worker.Options{
 		Workers:   cfg.WorkerCount,
 		QueueSize: cfg.QueueSize,
-		// One job must outlive a slow OpenAI call plus the WhatsApp send.
-		JobTimeout: cfg.OpenAITimeout() + cfg.WhatsAppTimeout() + 15*time.Second,
+		// One job must outlive a slow OpenAI call, reply pacing and the
+		// WhatsApp send.
+		JobTimeout: cfg.OpenAITimeout() + cfg.WhatsAppReplyDelayMax + cfg.WhatsAppTimeout() + 15*time.Second,
 		Logger:     log,
 	})
 	pool.Start(context.WithoutCancel(ctx))

@@ -46,6 +46,8 @@ type Config struct {
 	WhatsAppAPIBaseURL    string
 	WhatsAppAPIVersion    string
 	WhatsAppTimeoutSecond int
+	WhatsAppReplyDelayMin time.Duration
+	WhatsAppReplyDelayMax time.Duration
 
 	// Lead handoff target
 	DianaWhatsAppPhone  string
@@ -103,6 +105,8 @@ func Load() (*Config, error) {
 		WhatsAppAPIBaseURL:    getenv("WHATSAPP_API_BASE_URL", "https://graph.facebook.com"),
 		WhatsAppAPIVersion:    getenv("WHATSAPP_API_VERSION", "v21.0"),
 		WhatsAppTimeoutSecond: getenvInt("WHATSAPP_TIMEOUT_SECONDS", 15),
+		WhatsAppReplyDelayMin: time.Duration(getenvInt("WHATSAPP_BOT_REPLY_DELAY_MIN_MS", 1500)) * time.Millisecond,
+		WhatsAppReplyDelayMax: time.Duration(getenvInt("WHATSAPP_BOT_REPLY_DELAY_MAX_MS", 3000)) * time.Millisecond,
 
 		DianaWhatsAppPhone:  os.Getenv("DIANA_WHATSAPP_PHONE"),
 		DianaWhatsAppUserID: os.Getenv("DIANA_WHATSAPP_USER_ID"),
@@ -143,6 +147,15 @@ func (c *Config) Validate() error {
 	}
 	if c.WhatsAppVerifyToken == "" {
 		problems = append(problems, "WHATSAPP_VERIFY_TOKEN is required")
+	}
+	if c.WhatsAppReplyDelayMin <= 0 {
+		problems = append(problems, "WHATSAPP_BOT_REPLY_DELAY_MIN_MS must be > 0")
+	}
+	if c.WhatsAppReplyDelayMax <= 0 {
+		problems = append(problems, "WHATSAPP_BOT_REPLY_DELAY_MAX_MS must be > 0")
+	}
+	if c.WhatsAppReplyDelayMax <= c.WhatsAppReplyDelayMin {
+		problems = append(problems, "WHATSAPP_BOT_REPLY_DELAY_MAX_MS must be greater than WHATSAPP_BOT_REPLY_DELAY_MIN_MS")
 	}
 	if c.SQLitePath == "" {
 		problems = append(problems, "SQLITE_PATH is required")

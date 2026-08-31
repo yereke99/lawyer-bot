@@ -34,6 +34,7 @@ const (
 	StageAIRejected      = "ai_response_rejected"
 	StageDecision        = "response_decision"
 	StageReplyBuilt      = "reply_built"
+	StageReplyDelayed    = "reply_delayed"
 	StageReplySent       = "reply_sent"
 	StageReplyFailed     = "reply_failed"
 	StageStateChanged    = "state_changed"

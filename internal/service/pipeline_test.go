@@ -65,8 +65,9 @@ type stubWhatsApp struct {
 }
 
 type sentMessage struct {
-	To   string
-	Text string
+	To     string
+	Text   string
+	SentAt time.Time
 }
 
 func (s *stubWhatsApp) SendText(_ context.Context, recipient, text string) (domain.SendResult, error) {
@@ -75,7 +76,7 @@ func (s *stubWhatsApp) SendText(_ context.Context, recipient, text string) (doma
 	if s.err != nil {
 		return domain.SendResult{}, s.err
 	}
-	s.sent = append(s.sent, sentMessage{To: recipient, Text: text})
+	s.sent = append(s.sent, sentMessage{To: recipient, Text: text, SentAt: time.Now()})
 	return domain.SendResult{MessageID: "wamid.out." + recipient}, nil
 }
 
@@ -169,6 +170,13 @@ func inbound(id, text string) domain.InboundMessage {
 	}
 }
 
+func inboundFor(userID, id, text string) domain.InboundMessage {
+	msg := inbound(id, text)
+	msg.WhatsAppUserID = userID
+	msg.PhoneNumber = userID
+	return msg
+}
+
 func (h *harness) stages(t *testing.T, traceID string) []string {
 	t.Helper()
 	events, err := h.trace.ByTraceID(context.Background(), traceID)
@@ -189,6 +197,29 @@ func hasStage(stages []string, want string) bool {
 		}
 	}
 	return false
+}
+
+func waitUntil(t *testing.T, timeout time.Duration, ok func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if ok() {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatal("condition was not met before timeout")
+}
+
+func (h *harness) outgoingCount(t *testing.T) int {
+	t.Helper()
+	var n int
+	if err := h.db.QueryRowContext(context.Background(),
+		`SELECT COUNT(*) FROM messages WHERE direction = ?`,
+		string(domain.DirectionOutgoing)).Scan(&n); err != nil {
+		t.Fatalf("count outgoing messages: %v", err)
+	}
+	return n
 }
 
 // --------------------------------------------------------------------- tests
@@ -447,6 +478,136 @@ func TestDuplicateWebhookDeliveryIsProcessedOnce(t *testing.T) {
 	}
 	if got := h.wa.messages(); len(got) != 1 {
 		t.Fatalf("a retried webhook must not be answered twice, got %d replies", len(got))
+	}
+}
+
+func TestStateIsPersistedBeforeDelayedReplySend(t *testing.T) {
+	ai := &stubAI{results: []domain.AIClassification{{
+		IsRelevant: true, ShouldRespond: true,
+		Language: domain.LangRU, Intent: domain.IntentServiceInquiry, Confidence: 0.95,
+	}}}
+	h := newHarness(t, ai)
+	h.pipeline.cfg.ReplyDelayMin = 80 * time.Millisecond
+	h.pipeline.cfg.ReplyDelayMax = 120 * time.Millisecond
+
+	errCh := make(chan error, 1)
+	msg := inbound("wamid.delay.state", "Какие у вас услуги?")
+	msg.TraceID = "trace-delay-state"
+	go func() {
+		errCh <- h.pipeline.Handle(context.Background(), msg)
+	}()
+
+	waitUntil(t, time.Second, func() bool {
+		return h.outgoingCount(t) == 1
+	})
+
+	user, err := h.users.GetByWhatsAppID(context.Background(), "77015551234")
+	if err != nil {
+		t.Fatalf("load user: %v", err)
+	}
+	if user.CurrentState != domain.StateWaitingIntent {
+		t.Fatalf("state = %q, want %q before send", user.CurrentState, domain.StateWaitingIntent)
+	}
+	if got := h.wa.messages(); len(got) != 0 {
+		t.Fatalf("reply was sent before the delay finished: %+v", got)
+	}
+
+	if err := <-errCh; err != nil {
+		t.Fatalf("handle: %v", err)
+	}
+	sent := h.wa.messages()
+	if len(sent) != 1 {
+		t.Fatalf("want 1 delayed reply, got %d: %+v", len(sent), sent)
+	}
+	if !hasStage(h.stages(t, msg.TraceID), domain.StageReplyDelayed) {
+		t.Fatalf("trace is missing %q", domain.StageReplyDelayed)
+	}
+}
+
+func TestDuplicateWebhookDeliveryDuringReplyDelayIsProcessedOnce(t *testing.T) {
+	ai := &stubAI{results: []domain.AIClassification{{
+		IsRelevant: true, ShouldRespond: true,
+		Language: domain.LangRU, Intent: domain.IntentServiceInquiry, Confidence: 0.95,
+	}}}
+	h := newHarness(t, ai)
+	h.pipeline.cfg.ReplyDelayMin = 80 * time.Millisecond
+	h.pipeline.cfg.ReplyDelayMax = 120 * time.Millisecond
+
+	msg := inbound("wamid.dup.delay", "Какие у вас услуги?")
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- h.pipeline.Handle(context.Background(), msg)
+	}()
+
+	waitUntil(t, time.Second, func() bool {
+		return h.outgoingCount(t) == 1
+	})
+	if err := h.pipeline.Handle(context.Background(), msg); err != nil {
+		t.Fatalf("duplicate while first reply is delayed: %v", err)
+	}
+	if err := <-errCh; err != nil {
+		t.Fatalf("first handle: %v", err)
+	}
+
+	if h.ai.callCount() != 1 {
+		t.Fatalf("a retried webhook must not be classified twice, got %d calls", h.ai.callCount())
+	}
+	if got := h.wa.messages(); len(got) != 1 {
+		t.Fatalf("a retried webhook must not be answered twice, got %d replies", len(got))
+	}
+}
+
+func TestReplyDelaysAreIndependentAcrossChats(t *testing.T) {
+	ai := &stubAI{results: []domain.AIClassification{
+		{IsRelevant: true, ShouldRespond: true, Language: domain.LangRU, Intent: domain.IntentServiceInquiry, Confidence: 0.95},
+		{IsRelevant: true, ShouldRespond: true, Language: domain.LangRU, Intent: domain.IntentServiceInquiry, Confidence: 0.95},
+	}}
+	h := newHarness(t, ai)
+	h.pipeline.cfg.ReplyDelayMin = 100 * time.Millisecond
+	h.pipeline.cfg.ReplyDelayMax = 120 * time.Millisecond
+
+	started := time.Now()
+	errCh := make(chan error, 2)
+	go func() {
+		errCh <- h.pipeline.Handle(context.Background(),
+			inboundFor("77015550001", "wamid.parallel.a", "Какие у вас услуги?"))
+	}()
+	go func() {
+		errCh <- h.pipeline.Handle(context.Background(),
+			inboundFor("77015550002", "wamid.parallel.b", "Какие у вас услуги?"))
+	}()
+
+	for i := 0; i < 2; i++ {
+		if err := <-errCh; err != nil {
+			t.Fatalf("handle parallel message: %v", err)
+		}
+	}
+	elapsed := time.Since(started)
+	if elapsed >= 190*time.Millisecond {
+		t.Fatalf("different chats appear serialized, elapsed=%s", elapsed)
+	}
+	if got := h.wa.messages(); len(got) != 2 {
+		t.Fatalf("want 2 replies, got %d: %+v", len(got), got)
+	}
+}
+
+func TestContextCancellationDuringReplyDelayStopsSend(t *testing.T) {
+	ai := &stubAI{results: []domain.AIClassification{{
+		IsRelevant: true, ShouldRespond: true,
+		Language: domain.LangRU, Intent: domain.IntentServiceInquiry, Confidence: 0.95,
+	}}}
+	h := newHarness(t, ai)
+	h.pipeline.cfg.ReplyDelayMin = 80 * time.Millisecond
+	h.pipeline.cfg.ReplyDelayMax = 120 * time.Millisecond
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
+	defer cancel()
+	err := h.pipeline.Handle(ctx, inbound("wamid.delay.cancel", "Какие у вас услуги?"))
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("want deadline exceeded, got %v", err)
+	}
+	if got := h.wa.messages(); len(got) != 0 {
+		t.Fatalf("reply must not be sent after context cancellation, got %+v", got)
 	}
 }
 
