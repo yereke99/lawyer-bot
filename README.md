@@ -10,18 +10,22 @@ of questions, and hands a qualified lead to Diana.
 Three rules are enforced by the architecture, not just by the prompt:
 
 1. **The bot never starts a conversation.** Every code path that sends a message
-   is reachable only from an inbound webhook.
+   is reachable only from an inbound Green API polling notification or Meta
+   webhook.
 2. **The bot does not answer every message.** Greetings, "как дела?", "какая
    погода?" are stored, traced, and ignored.
-3. **The model never decides to reply.** OpenAI returns a classification;
-   deterministic Go code in `response_decision.go` decides what happens.
+3. **The model never decides whether to reply.** OpenAI returns a
+   classification; deterministic Go code in `response_decision.go` decides
+   whether a response is allowed. When `LLM_AGENT_REPLIES=true`, OpenAI then
+   writes the customer-facing wording for that allowed response.
 
 ## Pipeline
 
 ```
-webhook -> store -> gate -> classify -> decide -> reply delay -> reply -> qualify -> notify
-             |        |         |          |          |          |         |
-          always   free     OpenAI     Go rules    timer    template   to Diana
+green polling/webhook -> store -> gate -> classify -> decide -> agent/template -> reply delay -> reply -> qualify -> notify
+                         |        |         |          |          |              |          |         |
+                      always   free     OpenAI     Go rules   OpenAI or       timer   WhatsApp   to Diana
+                                                             safe fallback
 ```
 
 The **gate** (`internal/service/gate.go`) is the token budget guard. It runs
@@ -47,11 +51,11 @@ model.
 
 ## Pricing
 
-No service ships with a fixed price. Replies are built from templates, so the
-model structurally cannot invent an amount. Any model-authored text containing
-digits or a currency token is discarded before it reaches the customer
-(`SanitizeQuestion`, `containsPrice`). To publish a real price, set
-`HasFixedPrice` and the `FixedPrice*` fields on that service in
+No service ships with a fixed price. In agent mode, model-authored customer
+replies are filtered before sending; anything containing a price-like token,
+currency or suspicious amount is discarded and the bot falls back to the safe
+template wording (`SanitizeReply`, `SanitizeQuestion`). To publish a real
+price, set `HasFixedPrice` and the `FixedPrice*` fields on that service in
 `internal/service/catalog.go`.
 
 ## Layout
@@ -61,18 +65,19 @@ cmd/main.go                          wiring and graceful shutdown
 config/config.go                     all env configuration + .env loader
 internal/
   domain/                            types only, no dependencies
-  handler/     whatsapp.go router.go webhook termination, no business logic
+  handler/     greenapi_polling.go    Green API native polling
+               whatsapp.go router.go  Meta webhook termination, no business logic
   service/     qualification.go      the pipeline orchestrator
                gate.go               token budget guard (pre-filter)
                triggers.go           deterministic phrase matching (ru/kk/en)
                response_decision.go  the only place that decides to reply
                catalog.go            legal service catalog
-               reply.go              reply templates, price protection
+               reply.go              fallback templates, price protection
                lead.go               lead scoring, summary, Diana notification
                phone.go              phone normalisation
   repository/                        SQLite: schema, migrations, queries
-  integration/openai/                strict JSON-schema classification client
-  integration/whatsapp/              Cloud API client + webhook parser
+  integration/openai/                classification + agent reply client
+  integration/whatsapp/              Green API and Cloud API clients + parsers
   worker/                            bounded worker pool
 traits/logger/                       zap, with phone masking
 ```
@@ -129,7 +134,7 @@ SELECT * FROM deliveries WHERE status = 'failed' ORDER BY created_at DESC;
 ## Running
 
 ```bash
-cp .env.example .env      # fill in OPENAI_API_KEY, WHATSAPP_*, DIANA_*
+cp .env.example .env      # fill in OPENAI_API_KEY, GREEN_API_*, DIANA_*
 go run ./cmd              # http server on :8080
 ```
 
@@ -144,13 +149,28 @@ WHATSAPP_BOT_REPLY_DELAY_MIN_MS=1500
 WHATSAPP_BOT_REPLY_DELAY_MAX_MS=3000
 ```
 
-The webhook is still acknowledged immediately; only the outgoing automatic bot
-reply is delayed. Lead notifications to Diana are sent without this pacing.
+Green API native polling receives and deletes queue notifications without
+waiting for the artificial reply delay; only the outgoing automatic bot reply is
+delayed. Lead notifications to Diana are sent without this pacing.
 
-Point the Meta webhook at `https://<host>/webhook/whatsapp` and use
-`WHATSAPP_VERIFY_TOKEN` for the subscription challenge. Set
-`WHATSAPP_APP_SECRET` so signatures are verified; without it the bot logs a
-warning at start-up and accepts unsigned payloads.
+For Green API polling, set:
+
+```env
+WHATSAPP_PROVIDER=greenapi
+GREEN_API_ID_INSTANCE=...
+GREEN_API_TOKEN_INSTANCE=...
+GREEN_API_API_URL=https://api.green-api.com
+GREEN_API_POLLING_ENABLED=true
+LLM_AGENT_REPLIES=true
+```
+
+If the Green API instance has a custom webhook URL configured, clear it in the
+Green API cabinet before using `receiveNotification`, otherwise Green API
+returns an error for polling.
+
+For Meta mode, set `WHATSAPP_PROVIDER=meta`, point the Meta webhook at
+`https://<host>/webhook/whatsapp`, and use `WHATSAPP_VERIFY_TOKEN` for the
+subscription challenge. Set `WHATSAPP_APP_SECRET` so signatures are verified.
 
 `GET /healthz` reports status, version and queue depth.
 
@@ -194,7 +214,7 @@ signature verification and the end-to-end pipeline including the Diana handoff.
   still completes.
 - SQLite errors: returned as controlled errors, never a panic in a handler.
 - A panic inside one message is recovered by the worker and never stops the bot.
-- Retried webhooks are deduplicated by `whatsapp_message_id`, so a customer is
-  never answered twice.
+- Retried webhooks and Green API notifications are deduplicated by provider
+  message ID, so a customer is never answered twice.
 - Per-chat processing is sequenced, so a delayed reply in one chat does not
   reorder that customer's bot messages or block unrelated chats.

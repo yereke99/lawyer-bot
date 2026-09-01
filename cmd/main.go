@@ -13,6 +13,7 @@ import (
 	"go.uber.org/zap"
 
 	"lawyer-bot/config"
+	"lawyer-bot/internal/domain"
 	"lawyer-bot/internal/handler"
 	"lawyer-bot/internal/integration/openai"
 	"lawyer-bot/internal/integration/whatsapp"
@@ -47,7 +48,9 @@ func run() error {
 	log.Info("starting lawyer-bot",
 		zap.String("version", version),
 		zap.String("env", cfg.Env),
+		zap.String("whatsapp_provider", cfg.WhatsAppProvider),
 		zap.String("model", cfg.OpenAIModel),
+		zap.Bool("llm_agent_replies", cfg.LLMAgentReplies),
 		zap.Bool("dry_run", cfg.DryRun))
 
 	// Root context, cancelled on SIGINT/SIGTERM.
@@ -78,13 +81,28 @@ func run() error {
 		Timeout:       cfg.OpenAITimeout(),
 	})
 
-	waClient := whatsapp.New(whatsapp.Options{
-		Token:         cfg.WhatsAppToken,
-		PhoneNumberID: cfg.WhatsAppPhoneNumberID,
-		BaseURL:       cfg.WhatsAppAPIBaseURL,
-		APIVersion:    cfg.WhatsAppAPIVersion,
-		Timeout:       cfg.WhatsAppTimeout(),
-	})
+	var (
+		waClient    domain.WhatsAppClient
+		greenClient *whatsapp.GreenClient
+	)
+	switch cfg.WhatsAppProvider {
+	case "greenapi":
+		greenClient = whatsapp.NewGreen(whatsapp.GreenOptions{
+			IDInstance:    cfg.GreenAPIIDInstance,
+			TokenInstance: cfg.GreenAPITokenInstance,
+			BaseURL:       cfg.GreenAPIBaseURL,
+			Timeout:       cfg.WhatsAppTimeout(),
+		})
+		waClient = greenClient
+	default:
+		waClient = whatsapp.New(whatsapp.Options{
+			Token:         cfg.WhatsAppToken,
+			PhoneNumberID: cfg.WhatsAppPhoneNumberID,
+			BaseURL:       cfg.WhatsAppAPIBaseURL,
+			APIVersion:    cfg.WhatsAppAPIVersion,
+			Timeout:       cfg.WhatsAppTimeout(),
+		})
+	}
 
 	// ------------------------------------------------------------ services
 	catalog := service.NewCatalog()
@@ -117,6 +135,7 @@ func run() error {
 		DryRun:          cfg.DryRun,
 		ReplyDelayMin:   cfg.WhatsAppReplyDelayMin,
 		ReplyDelayMax:   cfg.WhatsAppReplyDelayMax,
+		AgentReplies:    cfg.LLMAgentReplies,
 	})
 
 	// --------------------------------------------------------- worker pool
@@ -130,14 +149,28 @@ func run() error {
 	})
 	pool.Start(context.WithoutCancel(ctx))
 
+	if greenClient != nil && cfg.GreenAPIPollingEnabled {
+		poller := handler.NewGreenAPIPoller(greenClient, pipeline, trace, pool, log, handler.GreenAPIPollerConfig{
+			StoreRaw:              cfg.TraceRawPayload,
+			ReceiveTimeoutSeconds: cfg.GreenAPIReceiveTimeoutSeconds,
+			RetryDelay:            time.Duration(cfg.GreenAPIRetryDelaySeconds) * time.Second,
+		})
+		poller.Start(ctx)
+	}
+
 	// ---------------------------------------------------------------- http
-	webhook := handler.NewWhatsAppHandler(pipeline, trace, pool, log, handler.WhatsAppHandlerConfig{
-		VerifyToken: cfg.WhatsAppVerifyToken,
-		AppSecret:   cfg.WhatsAppAppSecret,
-		StoreRaw:    cfg.TraceRawPayload,
-	})
-	if cfg.WhatsAppAppSecret == "" {
-		log.Warn("WHATSAPP_APP_SECRET is not set: webhook signatures are not verified")
+	var webhook *handler.WhatsAppHandler
+	if cfg.WhatsAppProvider == "meta" {
+		webhook = handler.NewWhatsAppHandler(pipeline, trace, pool, log, handler.WhatsAppHandlerConfig{
+			VerifyToken: cfg.WhatsAppVerifyToken,
+			AppSecret:   cfg.WhatsAppAppSecret,
+			StoreRaw:    cfg.TraceRawPayload,
+		})
+		if cfg.WhatsAppAppSecret == "" {
+			log.Warn("WHATSAPP_APP_SECRET is not set: webhook signatures are not verified")
+		}
+	} else {
+		log.Info("whatsapp webhook disabled; green api native polling is the inbound transport")
 	}
 
 	router := handler.NewRouter(webhook, pool, log, handler.RouterConfig{
@@ -156,9 +189,7 @@ func run() error {
 
 	serverErr := make(chan error, 1)
 	go func() {
-		log.Info("http server listening",
-			zap.String("addr", cfg.HTTPAddr),
-			zap.String("webhook_path", cfg.WebhookPath))
+		log.Info("http server listening", zap.String("addr", cfg.HTTPAddr))
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			serverErr <- err
 		}

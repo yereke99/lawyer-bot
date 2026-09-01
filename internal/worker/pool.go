@@ -18,7 +18,7 @@ type Job func(ctx context.Context)
 
 // Pool is a bounded worker pool.
 //
-// The webhook handler must return quickly, but OpenAI calls take seconds. A
+// The inbound receiver must return quickly, but OpenAI calls take seconds. A
 // bounded pool decouples the two without spawning an unbounded number of
 // goroutines: when the queue is full, work is rejected loudly rather than
 // silently piling up.
@@ -103,7 +103,7 @@ func (p *Pool) run(base context.Context, id int) {
 }
 
 // Submit queues a job. It never blocks: if the queue is full the caller is told
-// immediately, so the webhook can still return a fast response.
+// immediately, so the inbound receiver can still return a fast response.
 func (p *Pool) Submit(job Job) error {
 	p.mu.Lock()
 	closed := p.closed

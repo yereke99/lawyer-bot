@@ -160,3 +160,12 @@ func TestUnknownActionProducesSilence(t *testing.T) {
 		t.Fatalf("ActionNone must produce no text, got %q", got)
 	}
 }
+
+func TestSanitizeReplyRejectsGeneratedPrices(t *testing.T) {
+	if _, ok := SanitizeReply("Стоимость будет 150000 тг."); ok {
+		t.Fatal("generated price must be rejected")
+	}
+	if got, ok := SanitizeReply("Понял, Диана сможет уточнить детали по вашему вопросу."); !ok || got == "" {
+		t.Fatalf("safe generated reply should pass, got %q ok=%t", got, ok)
+	}
+}

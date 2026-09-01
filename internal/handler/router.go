@@ -16,8 +16,9 @@ type RouterConfig struct {
 	Version     string
 }
 
-// NewRouter wires the HTTP endpoints. The webhook is the only route that
-// accepts external traffic; the rest is operational.
+// NewRouter wires the HTTP endpoints. When webhook is nil, the process exposes
+// only operational routes; Green API native polling does not need an inbound
+// WhatsApp webhook.
 func NewRouter(webhook *WhatsAppHandler, pool *worker.Pool, log *zap.Logger, cfg RouterConfig) http.Handler {
 	mux := http.NewServeMux()
 
@@ -25,7 +26,9 @@ func NewRouter(webhook *WhatsAppHandler, pool *worker.Pool, log *zap.Logger, cfg
 	if path == "" {
 		path = "/webhook/whatsapp"
 	}
-	mux.Handle(path, webhook)
+	if webhook != nil {
+		mux.Handle(path, webhook)
+	}
 
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]any{

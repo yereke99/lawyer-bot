@@ -13,11 +13,9 @@ import (
 	"lawyer-bot/internal/domain"
 )
 
-// Client is a thin OpenAI Chat Completions client specialised for one job:
-// returning a validated classification of a single customer message.
-//
-// It deliberately does not expose free-form generation. The bot's replies come
-// from templates, so the model can never invent a price or ramble.
+// Client is a thin OpenAI Chat Completions client. The service layer uses it in
+// two steps: first for structured classification, then for a customer-facing
+// agent reply only after deterministic application rules allow a response.
 type Client struct {
 	apiKey     string
 	baseURL    string
@@ -91,6 +89,29 @@ func (c *Client) ClassifyMessage(ctx context.Context, in domain.AIInput) (domain
 	return result, nil
 }
 
+// GenerateReply implements domain.AIReplyClient.
+func (c *Client) GenerateReply(ctx context.Context, in domain.AIReplyInput) (domain.AIReply, error) {
+	started := time.Now()
+
+	reqBody := c.buildReplyRequest(in)
+	raw, usage, err := c.call(ctx, reqBody)
+	out := domain.AIReply{
+		Text:             strings.TrimSpace(raw),
+		Model:            c.model,
+		InputTokens:      usage.PromptTokens,
+		OutputTokens:     usage.CompletionTokens,
+		RawResponse:      raw,
+		ProcessingTimeMS: time.Since(started).Milliseconds(),
+	}
+	if err != nil {
+		return out, err
+	}
+	if out.Text == "" {
+		return out, fmt.Errorf("openai returned empty agent reply")
+	}
+	return out, nil
+}
+
 func (c *Client) buildRequest(in domain.AIInput) chatRequest {
 	messages := make([]chatMessage, 0, len(in.History)+3)
 	messages = append(messages, chatMessage{Role: "system", Content: systemPrompt(in)})
@@ -115,6 +136,32 @@ func (c *Client) buildRequest(in domain.AIInput) chatRequest {
 		MaxCompletionTokens: c.maxTokens,
 		Temperature:         &temp,
 		ResponseFormat:      responseFormat(),
+	}
+}
+
+func (c *Client) buildReplyRequest(in domain.AIReplyInput) chatRequest {
+	messages := make([]chatMessage, 0, len(in.History)+3)
+	messages = append(messages, chatMessage{Role: "system", Content: agentSystemPrompt(in)})
+
+	for _, h := range in.History {
+		role := "user"
+		if h.Role == "assistant" {
+			role = "assistant"
+		}
+		messages = append(messages, chatMessage{Role: role, Content: truncate(h.Text, c.maxInput/2)})
+	}
+
+	messages = append(messages, chatMessage{
+		Role:    "user",
+		Content: agentUserPrompt(in, c.maxInput),
+	})
+
+	temp := 0.7
+	return chatRequest{
+		Model:               c.model,
+		Messages:            messages,
+		MaxCompletionTokens: c.maxTokens,
+		Temperature:         &temp,
 	}
 }
 

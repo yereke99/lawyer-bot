@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"strconv"
+	"strings"
 	"time"
 
 	"lawyer-bot/internal/domain"
@@ -106,11 +107,62 @@ type mediaObject struct {
 	Voice    bool   `json:"voice"`
 }
 
+type greenWebhookPayload struct {
+	TypeWebhook  string `json:"typeWebhook"`
+	InstanceData struct {
+		IDInstance   int64  `json:"idInstance"`
+		WID          string `json:"wid"`
+		TypeInstance string `json:"typeInstance"`
+	} `json:"instanceData"`
+	Timestamp  int64  `json:"timestamp"`
+	IDMessage  string `json:"idMessage"`
+	SenderData struct {
+		ChatID            string `json:"chatId"`
+		Sender            string `json:"sender"`
+		ChatName          string `json:"chatName"`
+		SenderName        string `json:"senderName"`
+		SenderContactName string `json:"senderContactName"`
+	} `json:"senderData"`
+	MessageData struct {
+		TypeMessage     string `json:"typeMessage"`
+		TextMessageData struct {
+			TextMessage string `json:"textMessage"`
+		} `json:"textMessageData"`
+		ExtendedTextMessageData struct {
+			Text string `json:"text"`
+		} `json:"extendedTextMessageData"`
+		FileMessageData struct {
+			DownloadURL string `json:"downloadUrl"`
+			Caption     string `json:"caption"`
+			FileName    string `json:"fileName"`
+			MimeType    string `json:"mimeType"`
+		} `json:"fileMessageData"`
+		LocationMessageData struct {
+			NameLocation string `json:"nameLocation"`
+			Address      string `json:"address"`
+		} `json:"locationMessageData"`
+		ContactMessageData struct {
+			DisplayName string `json:"displayName"`
+			VCard       string `json:"vcard"`
+		} `json:"contactMessageData"`
+	} `json:"messageData"`
+}
+
 // ParseWebhook converts a raw webhook body into provider-independent messages.
 //
 // Delivery-status callbacks and other non-message events yield an empty slice:
 // the bot only ever reacts to real incoming messages.
 func ParseWebhook(body []byte) ([]domain.InboundMessage, error) {
+	var probe struct {
+		TypeWebhook string `json:"typeWebhook"`
+	}
+	if err := json.Unmarshal(body, &probe); err != nil {
+		return nil, fmt.Errorf("decode webhook payload: %w", err)
+	}
+	if probe.TypeWebhook != "" {
+		return parseGreenWebhook(body)
+	}
+
 	var payload webhookPayload
 	if err := json.Unmarshal(body, &payload); err != nil {
 		return nil, fmt.Errorf("decode webhook payload: %w", err)
@@ -133,6 +185,17 @@ func ParseWebhook(body []byte) ([]domain.InboundMessage, error) {
 		}
 	}
 	return out, nil
+}
+
+func parseGreenWebhook(body []byte) ([]domain.InboundMessage, error) {
+	var payload greenWebhookPayload
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return nil, fmt.Errorf("decode green api webhook payload: %w", err)
+	}
+	if payload.TypeWebhook != "incomingMessageReceived" {
+		return nil, nil
+	}
+	return []domain.InboundMessage{convertGreenMessage(payload)}, nil
 }
 
 func convertMessage(m webhookMessage, displayName string) domain.InboundMessage {
@@ -214,6 +277,58 @@ func convertMessage(m webhookMessage, displayName string) domain.InboundMessage 
 	return in
 }
 
+func convertGreenMessage(m greenWebhookPayload) domain.InboundMessage {
+	displayName := firstNonEmpty(m.SenderData.SenderContactName, m.SenderData.SenderName, m.SenderData.ChatName)
+	chatID := firstNonEmpty(m.SenderData.ChatID, m.SenderData.Sender)
+	in := domain.InboundMessage{
+		WhatsAppUserID:    chatID,
+		PhoneNumber:       greenPhoneNumber(firstNonEmpty(m.SenderData.Sender, chatID)),
+		DisplayName:       displayName,
+		WhatsAppMessageID: m.IDMessage,
+		Timestamp:         time.Unix(m.Timestamp, 0).UTC(),
+		Source:            domain.SourceWhatsApp,
+	}
+	if m.Timestamp == 0 {
+		in.Timestamp = time.Now().UTC()
+	}
+
+	switch m.MessageData.TypeMessage {
+	case "textMessage":
+		in.MessageType = domain.MessageText
+		in.Text = m.MessageData.TextMessageData.TextMessage
+	case "extendedTextMessage", "quotedMessage":
+		in.MessageType = domain.MessageText
+		in.Text = m.MessageData.ExtendedTextMessageData.Text
+	case "imageMessage":
+		in.MessageType = domain.MessageImage
+		applyGreenFile(&in, m)
+	case "videoMessage":
+		in.MessageType = domain.MessageVideo
+		applyGreenFile(&in, m)
+	case "audioMessage":
+		in.MessageType = domain.MessageAudio
+		applyGreenFile(&in, m)
+	case "documentMessage":
+		in.MessageType = domain.MessageDocument
+		applyGreenFile(&in, m)
+	case "stickerMessage":
+		in.MessageType = domain.MessageSticker
+		applyGreenFile(&in, m)
+	case "locationMessage":
+		in.MessageType = domain.MessageLocation
+		in.Caption = joinNonEmpty(" ", m.MessageData.LocationMessageData.NameLocation,
+			m.MessageData.LocationMessageData.Address)
+	case "contactMessage":
+		in.MessageType = domain.MessageContact
+		in.Caption = joinNonEmpty(" ", m.MessageData.ContactMessageData.DisplayName,
+			m.MessageData.ContactMessageData.VCard)
+	default:
+		in.MessageType = domain.MessageUnknown
+	}
+
+	return in
+}
+
 func applyMedia(in *domain.InboundMessage, m *mediaObject) {
 	if m == nil {
 		return
@@ -224,6 +339,13 @@ func applyMedia(in *domain.InboundMessage, m *mediaObject) {
 	in.Caption = m.Caption
 	in.Filename = m.Filename
 	in.Voice = m.Voice
+}
+
+func applyGreenFile(in *domain.InboundMessage, m greenWebhookPayload) {
+	in.MediaID = m.IDMessage
+	in.MimeType = m.MessageData.FileMessageData.MimeType
+	in.Caption = m.MessageData.FileMessageData.Caption
+	in.Filename = m.MessageData.FileMessageData.FileName
 }
 
 func referralSource(sourceType string) string {
@@ -260,4 +382,29 @@ func joinNonEmpty(sep string, parts ...string) string {
 		out += p
 	}
 	return out
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value != "" {
+			return value
+		}
+	}
+	return ""
+}
+
+func greenPhoneNumber(value string) string {
+	value = strings.TrimSpace(value)
+	if before, _, ok := strings.Cut(value, "@"); ok {
+		value = before
+	}
+
+	var b strings.Builder
+	for _, r := range value {
+		if r >= '0' && r <= '9' {
+			b.WriteRune(r)
+		}
+	}
+	return b.String()
 }

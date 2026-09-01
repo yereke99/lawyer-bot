@@ -105,6 +105,40 @@ type AIClient interface {
 	ClassifyMessage(ctx context.Context, input AIInput) (AIClassification, error)
 }
 
+// AIReplyInput is the context used when the model writes the actual WhatsApp
+// reply after the application has already decided that a reply is allowed.
+type AIReplyInput struct {
+	Text              string
+	History           []AIContextMessage
+	CurrentState      ConversationState
+	DetectedService   string
+	KnownLanguage     Language
+	KnownFacts        map[string]string
+	Services          []LegalService
+	Classification    AIClassification
+	ReplyAction       string
+	DecisionReason    string
+	DecisionService   string
+	DecisionNextState ConversationState
+	HasPhone          bool
+}
+
+// AIReply is a model-authored customer-facing answer plus audit metadata.
+type AIReply struct {
+	Text             string
+	Model            string
+	InputTokens      int
+	OutputTokens     int
+	RawResponse      string
+	ProcessingTimeMS int64
+}
+
+// AIReplyClient writes the customer-facing message. The service layer calls it
+// only after gate/decision rules have allowed an automatic bot response.
+type AIReplyClient interface {
+	GenerateReply(ctx context.Context, input AIReplyInput) (AIReply, error)
+}
+
 // AIInteraction is the persisted audit record of one model call.
 type AIInteraction struct {
 	ID               int64

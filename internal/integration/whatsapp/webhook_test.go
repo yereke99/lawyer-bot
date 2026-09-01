@@ -174,6 +174,54 @@ func TestAdReferralBecomesLeadSource(t *testing.T) {
 	}
 }
 
+func TestParseGreenAPITextMessage(t *testing.T) {
+	body := []byte(`{
+	  "typeWebhook": "incomingMessageReceived",
+	  "timestamp": 1700000000,
+	  "idMessage": "green-msg-1",
+	  "senderData": {
+	    "chatId": "77015551234@c.us",
+	    "sender": "77015551234@c.us",
+	    "senderName": "Аида"
+	  },
+	  "messageData": {
+	    "typeMessage": "textMessage",
+	    "textMessageData": {"textMessage": "Нужен юрист по договору"}
+	  }
+	}`)
+
+	got, err := ParseWebhook(body)
+	if err != nil {
+		t.Fatalf("parse green api payload: %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("want 1 message, got %d", len(got))
+	}
+	m := got[0]
+	if m.WhatsAppUserID != "77015551234@c.us" {
+		t.Fatalf("user id = %q", m.WhatsAppUserID)
+	}
+	if m.PhoneNumber != "77015551234" {
+		t.Fatalf("phone = %q", m.PhoneNumber)
+	}
+	if m.WhatsAppMessageID != "green-msg-1" {
+		t.Fatalf("message id = %q", m.WhatsAppMessageID)
+	}
+	if m.MessageType != domain.MessageText || m.Text != "Нужен юрист по договору" {
+		t.Fatalf("message = %q %q", m.MessageType, m.Text)
+	}
+}
+
+func TestParseGreenAPINonIncomingEventYieldsNoMessages(t *testing.T) {
+	got, err := ParseWebhook([]byte(`{"typeWebhook":"outgoingMessageReceived"}`))
+	if err != nil {
+		t.Fatalf("parse green api non incoming: %v", err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("non incoming event should not produce messages, got %d", len(got))
+	}
+}
+
 func TestMalformedPayloadIsRejected(t *testing.T) {
 	if _, err := ParseWebhook([]byte(`{not json`)); err == nil {
 		t.Fatal("malformed JSON should return an error")

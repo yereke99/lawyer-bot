@@ -163,6 +163,51 @@ func TestRequestUsesStrictSchemaAndTokenLimit(t *testing.T) {
 	}
 }
 
+func TestGenerateReplyUsesAgentPromptWithoutSchema(t *testing.T) {
+	var captured map[string]any
+	srv := newStubServer(t, "Понял, могу передать вопрос Диане для уточнения деталей.", &captured)
+	defer srv.Close()
+
+	got, err := newTestClient(srv.URL).GenerateReply(context.Background(), domain.AIReplyInput{
+		Text:          "Нужна регистрация товарного знака",
+		KnownLanguage: domain.LangRU,
+		CurrentState:  domain.StateNew,
+		ReplyAction:   "service_info",
+		Services:      testInput("").Services,
+		Classification: domain.AIClassification{
+			Intent:      domain.IntentTrademark,
+			ServiceCode: domain.ServiceTrademarkRegistration,
+			Summary:     "Регистрация товарного знака",
+			Confidence:  0.95,
+		},
+	})
+	if err != nil {
+		t.Fatalf("generate reply: %v", err)
+	}
+	if got.Text == "" {
+		t.Fatal("agent reply text should be returned")
+	}
+	if got.InputTokens != 210 || got.OutputTokens != 40 {
+		t.Errorf("token usage not captured: in=%d out=%d", got.InputTokens, got.OutputTokens)
+	}
+	if _, ok := captured["response_format"]; ok {
+		t.Fatal("agent reply must be free text, not JSON-schema classification")
+	}
+
+	messages, _ := captured["messages"].([]any)
+	if len(messages) < 2 {
+		t.Fatalf("want a system and a user message, got %d", len(messages))
+	}
+	system, _ := messages[0].(map[string]any)
+	prompt, _ := system["content"].(string)
+	if !strings.Contains(prompt, "Write the exact outgoing reply") {
+		t.Errorf("system prompt should describe agent reply generation:\n%s", prompt)
+	}
+	if !strings.Contains(prompt, "NEVER mention, estimate or invent any price") {
+		t.Errorf("agent prompt must forbid prices:\n%s", prompt)
+	}
+}
+
 // Model output is never trusted: unknown values are normalised away.
 func TestInvalidModelOutputIsNormalised(t *testing.T) {
 	content := `{

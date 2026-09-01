@@ -18,7 +18,7 @@ type Config struct {
 	Env      string
 	LogLevel string
 
-	// HTTP server exposing the WhatsApp webhook
+	// HTTP server exposing health checks and, in Meta mode, the WhatsApp webhook
 	HTTPAddr        string
 	WebhookPath     string
 	HTTPReadTimeout time.Duration
@@ -31,6 +31,7 @@ type Config struct {
 	OpenAIContextMessages int
 	OpenAITimeoutSeconds  int
 	OpenAIMaxInputChars   int
+	LLMAgentReplies       bool
 
 	// AI decision thresholds and token budget
 	AIMinConfidence     float64
@@ -39,6 +40,7 @@ type Config struct {
 	AIMinWordsUnmatched int
 
 	// WhatsApp (Meta Cloud API by default)
+	WhatsAppProvider      string
 	WhatsAppToken         string
 	WhatsAppPhoneNumberID string
 	WhatsAppVerifyToken   string
@@ -48,6 +50,14 @@ type Config struct {
 	WhatsAppTimeoutSecond int
 	WhatsAppReplyDelayMin time.Duration
 	WhatsAppReplyDelayMax time.Duration
+
+	// Green API native polling
+	GreenAPIIDInstance            string
+	GreenAPITokenInstance         string
+	GreenAPIBaseURL               string
+	GreenAPIPollingEnabled        bool
+	GreenAPIReceiveTimeoutSeconds int
+	GreenAPIRetryDelaySeconds     int
 
 	// Lead handoff target
 	DianaWhatsAppPhone  string
@@ -92,12 +102,14 @@ func Load() (*Config, error) {
 		OpenAIContextMessages: getenvInt("OPENAI_CONTEXT_MESSAGES", 10),
 		OpenAITimeoutSeconds:  getenvInt("OPENAI_TIMEOUT_SECONDS", 20),
 		OpenAIMaxInputChars:   getenvInt("OPENAI_MAX_INPUT_CHARS", 1200),
+		LLMAgentReplies:       getenvBool("LLM_AGENT_REPLIES", true),
 
 		AIMinConfidence:     getenvFloat("AI_MIN_CONFIDENCE", 0.75),
 		AIMaxCallsPerDay:    getenvInt("AI_MAX_CALLS_PER_USER_PER_DAY", 40),
 		AIAnalyzeUnmatched:  getenvBool("AI_ANALYZE_UNMATCHED", true),
 		AIMinWordsUnmatched: getenvInt("AI_MIN_WORDS_UNMATCHED", 3),
 
+		WhatsAppProvider:      strings.ToLower(getenv("WHATSAPP_PROVIDER", "meta")),
 		WhatsAppToken:         os.Getenv("WHATSAPP_TOKEN"),
 		WhatsAppPhoneNumberID: os.Getenv("WHATSAPP_PHONE_NUMBER_ID"),
 		WhatsAppVerifyToken:   os.Getenv("WHATSAPP_VERIFY_TOKEN"),
@@ -107,6 +119,13 @@ func Load() (*Config, error) {
 		WhatsAppTimeoutSecond: getenvInt("WHATSAPP_TIMEOUT_SECONDS", 15),
 		WhatsAppReplyDelayMin: time.Duration(getenvInt("WHATSAPP_BOT_REPLY_DELAY_MIN_MS", 1500)) * time.Millisecond,
 		WhatsAppReplyDelayMax: time.Duration(getenvInt("WHATSAPP_BOT_REPLY_DELAY_MAX_MS", 3000)) * time.Millisecond,
+
+		GreenAPIIDInstance:            getenvFirst([]string{"GREEN_API_ID_INSTANCE", "GREEN_API_INSTANCE"}, ""),
+		GreenAPITokenInstance:         getenvFirst([]string{"GREEN_API_TOKEN_INSTANCE", "GREEN_API_TOKEN"}, ""),
+		GreenAPIBaseURL:               getenvFirst([]string{"GREEN_API_API_URL", "GREEN_API_BASE_URL"}, "https://api.green-api.com"),
+		GreenAPIPollingEnabled:        getenvBool("GREEN_API_POLLING_ENABLED", true),
+		GreenAPIReceiveTimeoutSeconds: getenvInt("GREEN_API_RECEIVE_TIMEOUT_SECONDS", 5),
+		GreenAPIRetryDelaySeconds:     getenvInt("GREEN_API_RETRY_DELAY_SECONDS", 5),
 
 		DianaWhatsAppPhone:  os.Getenv("DIANA_WHATSAPP_PHONE"),
 		DianaWhatsAppUserID: os.Getenv("DIANA_WHATSAPP_USER_ID"),
@@ -139,14 +158,35 @@ func (c *Config) Validate() error {
 	if c.OpenAIModel == "" {
 		problems = append(problems, "OPENAI_MODEL is required")
 	}
-	if c.WhatsAppToken == "" {
-		problems = append(problems, "WHATSAPP_TOKEN is required")
-	}
-	if c.WhatsAppPhoneNumberID == "" {
-		problems = append(problems, "WHATSAPP_PHONE_NUMBER_ID is required")
-	}
-	if c.WhatsAppVerifyToken == "" {
-		problems = append(problems, "WHATSAPP_VERIFY_TOKEN is required")
+	switch c.WhatsAppProvider {
+	case "meta":
+		if c.WhatsAppToken == "" {
+			problems = append(problems, "WHATSAPP_TOKEN is required")
+		}
+		if c.WhatsAppPhoneNumberID == "" {
+			problems = append(problems, "WHATSAPP_PHONE_NUMBER_ID is required")
+		}
+		if c.WhatsAppVerifyToken == "" {
+			problems = append(problems, "WHATSAPP_VERIFY_TOKEN is required")
+		}
+	case "greenapi":
+		if c.GreenAPIIDInstance == "" {
+			problems = append(problems, "GREEN_API_ID_INSTANCE is required")
+		}
+		if c.GreenAPITokenInstance == "" {
+			problems = append(problems, "GREEN_API_TOKEN_INSTANCE is required")
+		}
+		if c.GreenAPIBaseURL == "" {
+			problems = append(problems, "GREEN_API_API_URL is required")
+		}
+		if c.GreenAPIReceiveTimeoutSeconds < 5 || c.GreenAPIReceiveTimeoutSeconds > 60 {
+			problems = append(problems, "GREEN_API_RECEIVE_TIMEOUT_SECONDS must be between 5 and 60")
+		}
+		if c.GreenAPIRetryDelaySeconds < 1 {
+			problems = append(problems, "GREEN_API_RETRY_DELAY_SECONDS must be >= 1")
+		}
+	default:
+		problems = append(problems, "WHATSAPP_PROVIDER must be meta or greenapi")
 	}
 	if c.WhatsAppReplyDelayMin <= 0 {
 		problems = append(problems, "WHATSAPP_BOT_REPLY_DELAY_MIN_MS must be > 0")
@@ -203,6 +243,15 @@ func (c *Config) NotificationRecipient() string {
 func getenv(key, def string) string {
 	if v := strings.TrimSpace(os.Getenv(key)); v != "" {
 		return v
+	}
+	return def
+}
+
+func getenvFirst(keys []string, def string) string {
+	for _, key := range keys {
+		if v := strings.TrimSpace(os.Getenv(key)); v != "" {
+			return v
+		}
 	}
 	return def
 }

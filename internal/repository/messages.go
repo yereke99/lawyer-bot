@@ -60,8 +60,8 @@ func (r *MessageRepository) Create(ctx context.Context, m *domain.Message) (int6
 }
 
 // ExistsByWhatsAppID reports whether a provider message ID was already stored.
-// WhatsApp retries webhook deliveries, so this guard prevents double processing
-// and double replies.
+// WhatsApp providers can redeliver notifications, so this guard prevents
+// double processing and double replies.
 func (r *MessageRepository) ExistsByWhatsAppID(ctx context.Context, whatsappMessageID string) (bool, error) {
 	if whatsappMessageID == "" {
 		return false, nil

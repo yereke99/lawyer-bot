@@ -19,11 +19,15 @@ import (
 
 // stubAI stands in for OpenAI. Tests never touch the real API.
 type stubAI struct {
-	mu      sync.Mutex
-	results []domain.AIClassification
-	err     error
-	calls   int
-	inputs  []domain.AIInput
+	mu           sync.Mutex
+	results      []domain.AIClassification
+	err          error
+	calls        int
+	inputs       []domain.AIInput
+	replyResults []domain.AIReply
+	replyErr     error
+	replyCalls   int
+	replyInputs  []domain.AIReplyInput
 }
 
 func (s *stubAI) ClassifyMessage(_ context.Context, in domain.AIInput) (domain.AIClassification, error) {
@@ -55,6 +59,37 @@ func (s *stubAI) callCount() int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.calls
+}
+
+func (s *stubAI) GenerateReply(_ context.Context, in domain.AIReplyInput) (domain.AIReply, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.replyInputs = append(s.replyInputs, in)
+	idx := s.replyCalls
+	s.replyCalls++
+
+	if s.replyErr != nil {
+		return domain.AIReply{Model: "stub"}, s.replyErr
+	}
+	if idx >= len(s.replyResults) {
+		if len(s.replyResults) == 0 {
+			return domain.AIReply{Model: "stub", Text: ""}, nil
+		}
+		idx = len(s.replyResults) - 1
+	}
+	out := s.replyResults[idx]
+	out.Model = "stub"
+	out.InputTokens = 80
+	out.OutputTokens = 35
+	out.RawResponse = out.Text
+	return out, nil
+}
+
+func (s *stubAI) replyCallCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.replyCalls
 }
 
 // stubWhatsApp records outbound messages instead of sending them.
@@ -320,6 +355,51 @@ func TestServiceInquiryReceivesTheMenu(t *testing.T) {
 		domain.StageAICompleted, domain.StageDecision, domain.StageReplyBuilt,
 		domain.StageReplySent, domain.StageStateChanged,
 	} {
+		if !hasStage(stages, want) {
+			t.Errorf("trace is missing stage %q, got %v", want, stages)
+		}
+	}
+}
+
+func TestTriggerMessageUsesLLMAgentReplyWhenEnabled(t *testing.T) {
+	agentText := "Понял, помогу с договором. Могу передать вопрос Диане, чтобы она уточнила детали."
+	ai := &stubAI{
+		results: []domain.AIClassification{{
+			IsRelevant: true, ShouldRespond: true,
+			Language: domain.LangRU, Intent: domain.IntentContractRequest,
+			ServiceCode: domain.ServiceContractDrafting, Confidence: 0.96,
+			LeadScore: 0.8, Summary: "Нужен договор",
+		}},
+		replyResults: []domain.AIReply{{Text: agentText}},
+	}
+	h := newHarness(t, ai)
+	h.pipeline.cfg.AgentReplies = true
+
+	msg := inbound("wamid.agent", "Нужен юрист, составить договор")
+	msg.TraceID = "trace-agent"
+	if err := h.pipeline.Handle(context.Background(), msg); err != nil {
+		t.Fatalf("handle: %v", err)
+	}
+
+	if ai.callCount() != 1 {
+		t.Fatalf("want 1 classification call, got %d", ai.callCount())
+	}
+	if ai.replyCallCount() != 1 {
+		t.Fatalf("want 1 agent reply call, got %d", ai.replyCallCount())
+	}
+	sent := h.wa.messages()
+	if len(sent) < 1 {
+		t.Fatal("want an agent reply")
+	}
+	if sent[0].Text != agentText {
+		t.Fatalf("customer should receive the LLM agent reply, got:\n%s", sent[0].Text)
+	}
+	if strings.Contains(sent[0].Text, "Товарный знак") {
+		t.Fatalf("customer got the static service menu instead of the agent reply:\n%s", sent[0].Text)
+	}
+
+	stages := h.stages(t, "trace-agent")
+	for _, want := range []string{domain.StageAgentRequested, domain.StageAgentCompleted, domain.StageReplySent} {
 		if !hasStage(stages, want) {
 			t.Errorf("trace is missing stage %q, got %v", want, stages)
 		}

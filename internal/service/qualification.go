@@ -33,6 +33,7 @@ type Pipeline struct {
 	trace    *repository.TraceRepository
 
 	ai       domain.AIClient
+	agent    domain.AIReplyClient
 	wa       domain.WhatsAppClient
 	gate     *Gate
 	catalog  *Catalog
@@ -54,6 +55,7 @@ type PipelineConfig struct {
 	DryRun          bool
 	ReplyDelayMin   time.Duration
 	ReplyDelayMax   time.Duration
+	AgentReplies    bool
 }
 
 // PipelineDeps groups the pipeline's collaborators.
@@ -65,6 +67,7 @@ type PipelineDeps struct {
 	Trace    *repository.TraceRepository
 
 	AI       domain.AIClient
+	Agent    domain.AIReplyClient
 	WhatsApp domain.WhatsAppClient
 	Gate     *Gate
 	Catalog  *Catalog
@@ -83,6 +86,12 @@ func NewPipeline(deps PipelineDeps, cfg PipelineConfig) *Pipeline {
 		cfg.ContextMessages = 0
 	}
 	cfg.ReplyDelayMin, cfg.ReplyDelayMax = normalizeReplyDelayRange(cfg.ReplyDelayMin, cfg.ReplyDelayMax)
+	agent := deps.Agent
+	if agent == nil {
+		if replyClient, ok := deps.AI.(domain.AIReplyClient); ok {
+			agent = replyClient
+		}
+	}
 	return &Pipeline{
 		users:    deps.Users,
 		messages: deps.Messages,
@@ -90,6 +99,7 @@ func NewPipeline(deps PipelineDeps, cfg PipelineConfig) *Pipeline {
 		aiLog:    deps.AILog,
 		trace:    deps.Trace,
 		ai:       deps.AI,
+		agent:    agent,
 		wa:       deps.WhatsApp,
 		gate:     deps.Gate,
 		catalog:  deps.Catalog,
@@ -114,8 +124,8 @@ func NewTraceID() string {
 
 // Handle processes one incoming message.
 //
-// It is only ever invoked from an inbound webhook. There is no code path in
-// this package that contacts a user first.
+// It is only ever invoked from an inbound provider message. There is no code
+// path in this package that contacts a user first.
 func (p *Pipeline) Handle(ctx context.Context, in domain.InboundMessage) error {
 	started := time.Now()
 	if in.TraceID == "" {
@@ -136,7 +146,7 @@ func (p *Pipeline) Handle(ctx context.Context, in domain.InboundMessage) error {
 	if duplicate {
 		p.event(ctx, domain.TraceEvent{TraceID: in.TraceID, Stage: domain.StageDuplicate,
 			Decision: domain.DecisionSilent, Reason: "message already processed"})
-		log.Info("duplicate webhook delivery ignored")
+		log.Info("duplicate provider delivery ignored")
 		return nil
 	}
 
@@ -159,7 +169,7 @@ func (p *Pipeline) Handle(ctx context.Context, in domain.InboundMessage) error {
 	if duplicate {
 		p.event(ctx, domain.TraceEvent{TraceID: in.TraceID, Stage: domain.StageDuplicate,
 			Decision: domain.DecisionSilent, Reason: "message already processed"})
-		log.Info("duplicate webhook delivery ignored")
+		log.Info("duplicate provider delivery ignored")
 		return nil
 	}
 
@@ -197,7 +207,7 @@ func (p *Pipeline) Handle(ctx context.Context, in domain.InboundMessage) error {
 		p.event(ctx, domain.TraceEvent{TraceID: in.TraceID, UserID: user.ID,
 			Stage: domain.StageDuplicate, Decision: domain.DecisionSilent,
 			Reason: "message already processed"})
-		log.Info("duplicate webhook delivery ignored")
+		log.Info("duplicate provider delivery ignored")
 		return nil
 	}
 	if err != nil {
@@ -331,6 +341,11 @@ func (p *Pipeline) Handle(ctx context.Context, in domain.InboundMessage) error {
 	// ------------------------------------------------------- 8. reply
 	lang := replyLanguage(classification.Language, user.Language)
 	text := p.composer.Compose(decision, lang, classification.ClarificationQuestion)
+	if p.shouldGenerateAgentReply(gateResult, aiFailed) {
+		if agentText, ok := p.generateAgentReply(ctx, log, user, messageID, in, classification, decision, lang, facts); ok {
+			text = agentText
+		}
+	}
 	if strings.TrimSpace(text) == "" {
 		p.event(ctx, domain.TraceEvent{TraceID: in.TraceID, UserID: user.ID, MessageID: messageID,
 			Stage: domain.StageReplyBuilt, Decision: domain.DecisionSilent,
@@ -426,6 +441,110 @@ func (p *Pipeline) classify(ctx context.Context, log *zap.Logger, user *domain.U
 			"output_tokens": result.OutputTokens,
 		})})
 	return result, false
+}
+
+func (p *Pipeline) shouldGenerateAgentReply(gate GateResult, aiFailed bool) bool {
+	if !p.cfg.AgentReplies || p.agent == nil || aiFailed || !gate.CallAI {
+		return false
+	}
+	return gate.Trigger.Matched || gate.Reason == GateReasonActiveFlow
+}
+
+func (p *Pipeline) generateAgentReply(ctx context.Context, log *zap.Logger, user *domain.User,
+	messageID int64, in domain.InboundMessage, cls domain.AIClassification,
+	decision Decision, lang domain.Language, facts map[string]string) (string, bool) {
+
+	history := p.history(ctx, log, user.ID, messageID)
+	if latest, err := p.trace.Facts(ctx, user.ID); err == nil {
+		facts = latest
+	} else if facts == nil {
+		facts = map[string]string{}
+		log.Warn("load user facts for agent reply failed", zap.Error(err))
+	}
+
+	serviceCode := decision.Service
+	if serviceCode == "" {
+		serviceCode = user.DetectedService
+	}
+	if serviceCode == "" {
+		serviceCode = cls.ServiceCode
+	}
+
+	p.event(ctx, domain.TraceEvent{TraceID: in.TraceID, UserID: user.ID, MessageID: messageID,
+		Stage: domain.StageAgentRequested, Decision: domain.DecisionCallAI,
+		Detail: repository.Detail(map[string]any{
+			"history_messages": len(history),
+			"action":           string(decision.Action),
+			"service":          serviceCode,
+		})})
+
+	result, err := p.agent.GenerateReply(ctx, domain.AIReplyInput{
+		Text:              in.Content(),
+		History:           history,
+		CurrentState:      user.CurrentState,
+		DetectedService:   user.DetectedService,
+		KnownLanguage:     lang,
+		KnownFacts:        facts,
+		Services:          p.catalog.All(),
+		Classification:    cls,
+		ReplyAction:       string(decision.Action),
+		DecisionReason:    decision.Reason,
+		DecisionService:   serviceCode,
+		DecisionNextState: decision.NextState,
+		HasPhone:          user.PhoneNumber != "",
+	})
+
+	record := &domain.AIInteraction{
+		UserID:           user.ID,
+		MessageID:        messageID,
+		TraceID:          in.TraceID,
+		Model:            result.Model,
+		InputTokens:      result.InputTokens,
+		OutputTokens:     result.OutputTokens,
+		Intent:           "agent_reply",
+		ServiceCode:      serviceCode,
+		Confidence:       cls.Confidence,
+		RawResponse:      result.RawResponse,
+		ProcessingTimeMS: result.ProcessingTimeMS,
+	}
+	if err != nil {
+		record.Error = err.Error()
+	}
+
+	text, ok := SanitizeReply(result.Text)
+	if err == nil && !ok {
+		record.Error = "agent reply rejected by sanitizer"
+	}
+	if _, logErr := p.aiLog.Create(ctx, record); logErr != nil {
+		log.Warn("store agent reply interaction failed", zap.Error(logErr))
+	}
+
+	if err != nil {
+		p.event(ctx, domain.TraceEvent{TraceID: in.TraceID, UserID: user.ID, MessageID: messageID,
+			Stage: domain.StageAgentFailed, Decision: domain.DecisionError,
+			Reason: "agent reply generation failed", Detail: errDetail(err),
+			DurationMS: result.ProcessingTimeMS})
+		log.Error("openai agent reply failed", zap.Error(err))
+		return "", false
+	}
+	if !ok {
+		p.event(ctx, domain.TraceEvent{TraceID: in.TraceID, UserID: user.ID, MessageID: messageID,
+			Stage: domain.StageAgentRejected, Decision: domain.DecisionError,
+			Reason: "agent reply rejected by sanitizer",
+			Detail: repository.Detail(map[string]any{"chars": len([]rune(result.Text))})})
+		log.Warn("agent reply rejected by sanitizer", logger.Preview("text", result.Text))
+		return "", false
+	}
+
+	p.event(ctx, domain.TraceEvent{TraceID: in.TraceID, UserID: user.ID, MessageID: messageID,
+		Stage: domain.StageAgentCompleted, Decision: domain.DecisionOK,
+		DurationMS: result.ProcessingTimeMS,
+		Detail: repository.Detail(map[string]any{
+			"chars":         len([]rune(text)),
+			"input_tokens":  result.InputTokens,
+			"output_tokens": result.OutputTokens,
+		})})
+	return text, true
 }
 
 // history builds the trimmed conversation context. Only recent user and bot
