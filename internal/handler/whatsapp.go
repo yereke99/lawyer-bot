@@ -124,6 +124,7 @@ func (h *WhatsAppHandler) receive(w http.ResponseWriter, r *http.Request) {
 	// Acknowledge before doing any slow work.
 	w.WriteHeader(http.StatusOK)
 
+	messages = privateWhatsAppMessages(messages, log)
 	if len(messages) == 0 {
 		// Status callbacks and other non-message events end here: the bot has
 		// nothing to react to.

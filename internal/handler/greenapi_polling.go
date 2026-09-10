@@ -130,6 +130,7 @@ func (p *GreenAPIPoller) handleNotification(ctx context.Context, notification *w
 		MessageCount: len(messages), Status: "received",
 	})
 
+	messages = privateWhatsAppMessages(messages, log)
 	for i, msg := range messages {
 		msg.TraceID = service.NewTraceID()
 		if err := p.enqueue(msg); err != nil {

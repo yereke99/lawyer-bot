@@ -158,6 +158,7 @@ func run() error {
 		CRM:      crmClients,
 		Messages: messages,
 		Trace:    trace,
+		Settings: settings,
 		Sender:   messenger,
 		Logger:   log,
 	}, service.FollowUpConfig{
@@ -180,6 +181,7 @@ func run() error {
 		Leads:    leads,
 		AILog:    aiLog,
 		Trace:    trace,
+		Settings: settings,
 		AI:       aiClient,
 		WhatsApp: waClient,
 		Gate:     gate,

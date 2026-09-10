@@ -137,6 +137,7 @@ type harness struct {
 	messages *repository.MessageRepository
 	leads    *repository.LeadRepository
 	trace    *repository.TraceRepository
+	settings *repository.SettingsRepository
 	db       *repository.DB
 }
 
@@ -156,6 +157,7 @@ func newHarness(t *testing.T, ai *stubAI) *harness {
 	leads := repository.NewLeadRepository(db)
 	aiLog := repository.NewAIInteractionRepository(db)
 	trace := repository.NewTraceRepository(db)
+	settings := repository.NewSettingsRepository(db)
 
 	catalog := NewCatalog()
 	triggers := NewTriggerSet()
@@ -167,6 +169,7 @@ func newHarness(t *testing.T, ai *stubAI) *harness {
 		Leads:    leads,
 		AILog:    aiLog,
 		Trace:    trace,
+		Settings: settings,
 		AI:       ai,
 		WhatsApp: wa,
 		Gate: NewGate(triggers, GateConfig{
@@ -188,7 +191,7 @@ func newHarness(t *testing.T, ai *stubAI) *harness {
 
 	return &harness{
 		pipeline: pipeline, ai: ai, wa: wa,
-		users: users, messages: messages, leads: leads, trace: trace, db: db,
+		users: users, messages: messages, leads: leads, trace: trace, settings: settings, db: db,
 	}
 }
 

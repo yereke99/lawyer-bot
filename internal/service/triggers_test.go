@@ -85,6 +85,24 @@ func TestTriggerMatchesSemanticVariants(t *testing.T) {
 	}
 }
 
+// Matching ignores padding, shouting, repeated spaces and line breaks, because
+// that is how people actually type on a phone.
+func TestTriggerMatchingIgnoresFormatting(t *testing.T) {
+	ts := NewTriggerSet()
+	variants := []string{
+		"Мне нужна консультация",
+		"   мне нужна консультация   ",
+		"МНЕ  НУЖНА\n\nКОНСУЛЬТАЦИЯ",
+		"Мне нужна консультация!!!",
+		"  Маған ТАУАР белгісін   тіркеу керек\n",
+	}
+	for _, v := range variants {
+		if !ts.Match(v).Matched {
+			t.Errorf("formatting must not hide a trigger: %q", v)
+		}
+	}
+}
+
 func TestNonLegalMessagesDoNotMatch(t *testing.T) {
 	ts := NewTriggerSet()
 	irrelevant := []string{

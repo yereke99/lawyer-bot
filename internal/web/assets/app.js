@@ -115,6 +115,7 @@ const state = {
   statuses: [],
   services: [],
   consultants: [],
+  settings: null,
   counts: { unread: 0, needsConsultant: 0, followUps: 0 },
   filters: { q: "", status: "", service: "", language: "", mode: "", assigned: "", blocked: "", from: "", to: "", sort: "last_activity", dir: "desc", limit: 50, offset: 0 },
   clients: { items: [], total: 0, loading: false },
@@ -239,10 +240,51 @@ function Sidebar() {
 
   return el("aside", { class: "sidebar" },
     el("div", { class: "brand" }, el("span", { class: `dot ${state.stream ? "" : "off"}` }), "Lawyer CRM"),
+    BotControl(),
     nav,
     el("div", { class: "sidebar-foot" },
       el("div", { class: "who" }, state.user?.name || state.user?.email || ""),
       el("div", {}, roleLabel(state.user?.role), state.version ? ` · v${state.version}` : "")));
+}
+
+// setBotEnabled drives the persisted automation switch. The browser never
+// decides what the switch shows: the value rendered afterwards is the one the
+// server returned, and a failed write is repaired from the server too.
+async function setBotEnabled(next) {
+  if (state.busy.has("whatsapp-bot")) return;
+  state.busy.add("whatsapp-bot");
+  try {
+    state.settings = await patch("/settings", { whatsapp_bot_enabled: next });
+    toast(`WhatsApp Bot ${next ? "ON" : "OFF"}`, "ok");
+  } catch (err) {
+    toast(err.message, "err");
+    try { state.settings = await get("/settings"); } catch { /* keep the last confirmed payload */ }
+  } finally {
+    state.busy.delete("whatsapp-bot");
+  }
+  await render();
+}
+
+function botConnectionLabel(status) {
+  return { connected: "подключён", disconnected: "нет связи" }[status] || "нет данных";
+}
+
+function BotControl() {
+  const wa = state.settings?.whatsapp || {};
+  const known = typeof wa.bot_enabled === "boolean";
+  const enabled = known ? wa.bot_enabled : true;
+  const busy = state.busy.has("whatsapp-bot");
+  const toggle = el("button", {
+    class: `bot-switch ${enabled ? "on" : "off"}`,
+    disabled: busy || !known,
+    title: known ? "Автоответы ассистента" : "Настройки не загружены",
+    onclick: () => setBotEnabled(!enabled),
+  }, el("span", {}, enabled ? "ON" : "OFF"));
+
+  return el("div", { class: "bot-card" },
+    el("div", { class: "bot-title" }, "WhatsApp Bot"),
+    toggle,
+    el("div", { class: "bot-status" }, "Подключение: ", botConnectionLabel(wa.connection_status)));
 }
 
 const roleLabel = (role) => ({ admin: "Администратор", consultant: "Консультант", readonly: "Только чтение" }[role] || role || "");
@@ -420,6 +462,14 @@ function modeChip(mode, blocked) {
   const map = { ai: ["blue", "Ассистент"], human: ["green", "Консультант"], paused: ["amber", "Пауза"] };
   const [tone, label] = map[mode] || ["", mode];
   return el("span", { class: `chip ${tone}` }, label);
+}
+
+function ModeText(mode) {
+  return ({ ai: "Ассистент", human: "Консультант", paused: "Пауза" }[mode] || mode || "—");
+}
+
+function serviceStatusLabel(status, label) {
+  return label || state.statuses.find((s) => s.code === status)?.label || status || "—";
 }
 
 /* --------------------------------------------------------- client detail */
@@ -683,12 +733,13 @@ function renderMessages(scroll) {
 const SENDER_LABEL = { client: "Клиент", ai: "Ассистент", consultant: "Консультант", system: "Система" };
 
 function MessageBubble(m) {
-  if (m.sender === "system") {
+  const sender = m.sender_type || m.sender;
+  if (sender === "system") {
     return el("div", { class: "msg sys" }, el("div", { class: "bubble" }, m.text));
   }
-  const out = m.direction === "outgoing";
+  const out = m.direction_type ? m.direction_type === "outbound" : m.direction === "outgoing";
   const bubble = el("div", { class: "bubble" });
-  bubble.append(el("div", { class: "who" }, SENDER_LABEL[m.sender] || m.sender));
+  bubble.append(el("div", { class: "who" }, SENDER_LABEL[sender] || m.sender_name || sender));
 
   if (m.media) bubble.append(MediaBlock(m));
   else if (m.media_unavailable) bubble.append(el("div", { class: "hint" }, `[${m.type}] файл недоступен`));
@@ -700,7 +751,7 @@ function MessageBubble(m) {
   else if (out && m.delivery === "sent") meta.append(" · ✓");
   bubble.append(meta);
 
-  return el("div", { class: `msg ${out ? "out" : "in"} ${m.sender === "consultant" ? "consultant" : ""}` }, bubble);
+  return el("div", { class: `msg ${out ? "out" : "in"} ${sender === "consultant" ? "consultant" : ""}` }, bubble);
 }
 
 function MediaBlock(m) {
@@ -759,6 +810,18 @@ function CrmPanel(c) {
     : el("div", { class: "hint" }, "Не запланировано");
 
   return el("div", { class: "row-gap" },
+    el("div", { class: "panel" },
+      el("div", { class: "panel-head" }, "Клиент"),
+      el("div", { class: "panel-body" },
+        el("dl", { class: "kv" },
+          el("dt", {}, "Имя"), el("dd", {}, c.name || c.phone || "—"),
+          el("dt", {}, "Телефон"), el("dd", {}, c.phone || "—"),
+          el("dt", {}, "Статус"), el("dd", {}, serviceStatusLabel(c.status, c.status_label)),
+          el("dt", {}, "State"), el("dd", {}, c.current_state || c.qualification_stage || "—"),
+          el("dt", {}, "Режим"), el("dd", {}, ModeText(c.mode)),
+          el("dt", {}, "Активность"), el("dd", {}, relative(c.last_message_at || c.last_inbound_at || c.last_outbound_at)),
+          el("dt", {}, "WhatsApp"), el("dd", {}, c.whatsapp_id || "—"),
+          el("dt", {}, "Оператор"), el("dd", {}, c.assigned_name || "—")))),
     el("div", { class: "panel" },
       el("div", { class: "panel-head" }, "Анализ ассистента"),
       el("div", { class: "panel-body row-gap" },
@@ -995,12 +1058,29 @@ function ExportsView() {
 
 async function SettingsView() {
   const s = await get("/settings");
+  state.settings = s;
   const current = el("input", { type: "password", placeholder: "текущий пароль" });
   const next = el("input", { type: "password", placeholder: "новый пароль" });
+  const botEnabled = s.whatsapp?.bot_enabled !== false;
+  const botToggle = el("button", {
+    class: `bot-switch settings ${botEnabled ? "on" : "off"}`,
+    disabled: state.busy.has("whatsapp-bot"),
+    onclick: () => setBotEnabled(!botEnabled),
+  }, el("span", {}, botEnabled ? "ON" : "OFF"));
 
   return el("div", {},
     Topbar("Настройки"),
     el("div", { class: "content row-gap" },
+      el("div", { class: "panel" },
+        el("div", { class: "panel-head" }, "WhatsApp"),
+        el("div", { class: "panel-body row-gap" },
+          el("div", { class: "settings-bot-row" },
+            el("div", {},
+              el("div", { class: "section-title" }, "Автоответы ассистента"),
+              el("div", { class: "hint" }, botEnabled ? "Включены" : "Выключены")),
+            botToggle),
+          el("dl", { class: "kv" },
+            el("dt", {}, "Подключение"), el("dd", {}, botConnectionLabel(s.whatsapp?.connection_status))))),
       el("div", { class: "panel" },
         el("div", { class: "panel-head" }, "Ассистент"),
         el("div", { class: "panel-body" },
@@ -1113,7 +1193,7 @@ async function loadConsultants() {
 }
 
 async function bootstrap() {
-  const [dash, services] = await Promise.allSettled([get("/dashboard"), get("/services")]);
+  const [dash, services, settings] = await Promise.allSettled([get("/dashboard"), get("/services"), get("/settings")]);
   if (dash.status === "fulfilled") {
     state.statuses = dash.value.statuses || [];
     state.counts.unread = dash.value.unread || 0;
@@ -1121,6 +1201,7 @@ async function bootstrap() {
     state.counts.followUps = dash.value.scheduled_follow_ups || 0;
   }
   if (services.status === "fulfilled") state.services = services.value.items || [];
+  if (settings.status === "fulfilled") state.settings = settings.value;
   await loadConsultants();
 }
 

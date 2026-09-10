@@ -489,15 +489,18 @@ func (a *API) handleMedia(w http.ResponseWriter, r *http.Request) {
 // ---------------------------------------------------------------- rendering
 
 func (a *API) clientSummary(c *domain.CRMClient) map[string]any {
+	name := contactDisplayName(c)
 	return map[string]any{
 		"id":              c.ID,
-		"name":            c.DisplayName,
+		"name":            name,
+		"display_name":    c.DisplayName,
 		"phone":           service.FormatE164(c.PhoneNumber),
 		"language":        string(c.Language.OrDefault()),
 		"service":         c.DetectedService,
 		"service_name":    a.catalog.Name(c.DetectedService, c.Language),
 		"status":          string(c.CRMStatus),
 		"status_label":    service.StatusLabel(c.CRMStatus, domain.LangRU),
+		"current_state":   string(c.CurrentState),
 		"mode":            string(c.Mode),
 		"blocked":         c.Blocked,
 		"assigned_id":     c.AssignedAdminID,
@@ -555,16 +558,21 @@ func renderMessage(m domain.Message) map[string]any {
 	if body == "" {
 		body = m.Caption
 	}
+	sender := m.SenderOrDefault()
 	item := map[string]any{
-		"id":          m.ID,
-		"direction":   string(m.Direction),
-		"sender":      string(m.SenderOrDefault()),
-		"type":        string(m.MessageType),
-		"text":        body,
-		"created_at":  m.CreatedAt,
-		"delivery":    m.DeliveryStatus,
-		"admin_id":    m.SenderAdminID,
-		"provider_id": m.WhatsAppMessageID,
+		"id":              m.ID,
+		"conversation_id": m.UserID,
+		"direction":       string(m.Direction),
+		"direction_type":  apiDirection(m.Direction),
+		"sender":          string(sender),
+		"sender_type":     string(sender),
+		"sender_name":     senderName(sender),
+		"type":            string(m.MessageType),
+		"text":            body,
+		"created_at":      m.CreatedAt,
+		"delivery":        m.DeliveryStatus,
+		"admin_id":        m.SenderAdminID,
+		"provider_id":     m.WhatsAppMessageID,
 	}
 	if m.MediaPath != "" {
 		item["media"] = map[string]any{
@@ -578,6 +586,41 @@ func renderMessage(m domain.Message) map[string]any {
 		item["media_unavailable"] = true
 	}
 	return item
+}
+
+func contactDisplayName(c *domain.CRMClient) string {
+	if c == nil {
+		return ""
+	}
+	if name := strings.TrimSpace(c.DisplayName); name != "" {
+		return name
+	}
+	if phone := service.FormatE164(c.PhoneNumber); phone != "" {
+		return phone
+	}
+	return c.WhatsAppUserID
+}
+
+func apiDirection(direction domain.Direction) string {
+	if direction == domain.DirectionOutgoing {
+		return "outbound"
+	}
+	return "inbound"
+}
+
+func senderName(sender domain.SenderType) string {
+	switch sender {
+	case domain.SenderClient:
+		return "Customer"
+	case domain.SenderAI:
+		return "Bot"
+	case domain.SenderConsultant:
+		return "Admin"
+	case domain.SenderSystem:
+		return "System"
+	default:
+		return string(sender)
+	}
 }
 
 func splitCSV(raw string) []string {

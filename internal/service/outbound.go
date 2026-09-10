@@ -123,8 +123,8 @@ var ErrNoFileSupport = errors.New("configured whatsapp provider cannot send file
 // speak in the same instant, their sends are serialised and both are stored in
 // the order they actually left the server.
 func (m *Messenger) Send(ctx context.Context, out Outbound) (SendResult, error) {
-	if out.Recipient == "" {
-		return SendResult{}, errors.New("recipient is required")
+	if err := domain.ValidatePrivateWhatsAppRecipient(out.Recipient); err != nil {
+		return SendResult{}, err
 	}
 	if strings.TrimSpace(out.Text) == "" && out.MediaPath == "" {
 		return SendResult{}, errors.New("message has neither text nor media")
@@ -266,6 +266,9 @@ func (m *Messenger) Send(ctx context.Context, out Outbound) (SendResult, error) 
 // SendRaw delivers a message to an address that is not a CRM client, such as
 // the lead alert sent to the company's own consultant number.
 func (m *Messenger) SendRaw(ctx context.Context, recipient, text string) (domain.SendResult, error) {
+	if err := domain.ValidatePrivateWhatsAppRecipient(recipient); err != nil {
+		return domain.SendResult{}, err
+	}
 	if m.dryRun {
 		return domain.SendResult{MessageID: "dry-run"}, nil
 	}

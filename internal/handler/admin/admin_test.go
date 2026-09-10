@@ -24,12 +24,14 @@ import (
 // apiHarness stands up the real API over a real database, with the WhatsApp
 // provider stubbed. Nothing here mocks the auth or CRM layers.
 type apiHarness struct {
-	server *httptest.Server
-	db     *repository.DB
-	client *http.Client
-	csrf   string
-	crm    *repository.CRMRepository
-	users  *repository.UserRepository
+	server   *httptest.Server
+	db       *repository.DB
+	client   *http.Client
+	csrf     string
+	crm      *repository.CRMRepository
+	users    *repository.UserRepository
+	messages *repository.MessageRepository
+	settings *repository.SettingsRepository
 }
 
 type stubSender struct{ fail bool }
@@ -88,7 +90,7 @@ func newAPIHarness(t *testing.T) *apiHarness {
 	}, service.MessengerConfig{})
 
 	follow := service.NewFollowUpService(service.FollowUpDeps{
-		Jobs: jobs, CRM: clients, Messages: messages, Sender: messenger, Logger: log,
+		Jobs: jobs, CRM: clients, Messages: messages, Settings: settings, Sender: messenger, Logger: log,
 	}, service.FollowUpConfig{Enabled: true, Delays: []time.Duration{time.Hour}})
 
 	auth := service.NewAuthService(admins, audit, log, service.AuthConfig{
@@ -120,6 +122,7 @@ func newAPIHarness(t *testing.T) *apiHarness {
 	}
 	return &apiHarness{
 		server: server, db: db, crm: clients, users: users,
+		messages: messages, settings: settings,
 		client: &http.Client{Jar: jar, Timeout: 5 * time.Second},
 	}
 }
@@ -204,6 +207,7 @@ func TestEveryAdminRouteRequiresAuthentication(t *testing.T) {
 		{http.MethodGet, "/api/audit"},
 		{http.MethodGet, "/api/export"},
 		{http.MethodGet, "/api/settings"},
+		{http.MethodPatch, "/api/settings"},
 		{http.MethodGet, "/api/media/1"},
 	}
 	for _, r := range routes {
@@ -232,6 +236,12 @@ func TestUnsafeRequestsRequireCSRFToken(t *testing.T) {
 	res, _ = h.do(t, http.MethodPost, "/api/clients/"+itoa(id)+"/takeover", map[string]string{})
 	if res.StatusCode != http.StatusForbidden {
 		t.Fatalf("a missing CSRF token must be refused, got %d", res.StatusCode)
+	}
+
+	h.csrf = ""
+	res, _ = h.do(t, http.MethodPatch, "/api/settings", map[string]any{"whatsapp_bot_enabled": false})
+	if res.StatusCode != http.StatusForbidden {
+		t.Fatalf("changing the bot switch must require a CSRF token, got %d", res.StatusCode)
 	}
 
 	// Reads are unaffected.
@@ -466,3 +476,131 @@ func TestMediaResponseIsNotExecutable(t *testing.T) {
 }
 
 func itoa(v int64) string { return strconv.FormatInt(v, 10) }
+
+// The bot switch is server state. The API answers with the stored value, the
+// value survives a fresh repository, and turning automation off never turns the
+// CRM off: a consultant can still reach the client.
+func TestBotSwitchIsPersistedAndCRMKeepsWorkingWhileItIsOff(t *testing.T) {
+	h := newAPIHarness(t)
+	id := h.seedClient(t)
+	h.login(t)
+	ctx := context.Background()
+
+	_, body := h.do(t, http.MethodGet, "/api/settings", nil)
+	if botEnabled(t, body) != true {
+		t.Fatal("automation must be on by default")
+	}
+
+	res, body := h.do(t, http.MethodPatch, "/api/settings", map[string]any{"whatsapp_bot_enabled": false})
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("switch off: %d %v", res.StatusCode, body)
+	}
+	if botEnabled(t, body) != false {
+		t.Fatal("the response must carry the value the server stored")
+	}
+
+	// Persisted, not remembered: a repository built after the write sees it.
+	stored, err := repository.NewSettingsRepository(h.db).WhatsAppBotEnabled(ctx)
+	if err != nil {
+		t.Fatalf("read stored switch: %v", err)
+	}
+	if stored {
+		t.Fatal("the switch must be persisted in the database")
+	}
+	_, body = h.do(t, http.MethodGet, "/api/settings", nil)
+	if botEnabled(t, body) != false {
+		t.Fatal("a later read must return the stored value")
+	}
+
+	// A manual reply still goes out, and is attributed to the consultant.
+	res, body = h.do(t, http.MethodPost, "/api/clients/"+itoa(id)+"/messages",
+		map[string]string{"text": "Здравствуйте, я подключилась."})
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("a manual reply must work while automation is off: %d %v", res.StatusCode, body)
+	}
+	message, _ := body["message"].(map[string]any)
+	if message["direction_type"] != "outbound" || message["sender_type"] != "consultant" {
+		t.Fatalf("manual reply attribution wrong: %v", message)
+	}
+
+	res, body = h.do(t, http.MethodPatch, "/api/settings", map[string]any{"whatsapp_bot_enabled": true})
+	if res.StatusCode != http.StatusOK || botEnabled(t, body) != true {
+		t.Fatalf("switch on: %d %v", res.StatusCode, body)
+	}
+
+	// An empty patch changes nothing and says so.
+	res, _ = h.do(t, http.MethodPatch, "/api/settings", map[string]any{})
+	if res.StatusCode != http.StatusBadRequest {
+		t.Fatalf("a patch with no supported setting must be refused, got %d", res.StatusCode)
+	}
+	if enabled, err := h.settings.WhatsAppBotEnabled(ctx); err != nil || !enabled {
+		t.Fatalf("a refused patch must not change the switch: %v %v", enabled, err)
+	}
+}
+
+// The conversation API states who sent each message instead of leaving the
+// browser to guess it from the text or the phone number.
+func TestConversationAPIStatesDirectionAndSender(t *testing.T) {
+	h := newAPIHarness(t)
+	id := h.seedClient(t)
+	h.login(t)
+	ctx := context.Background()
+
+	if _, err := h.messages.Create(ctx, &domain.Message{
+		UserID: id, WhatsAppMessageID: "wamid.in.1", MessageType: domain.MessageText,
+		Text: "Мне нужна консультация", Direction: domain.DirectionIncoming,
+		SenderType: domain.SenderClient,
+	}); err != nil {
+		t.Fatalf("seed inbound: %v", err)
+	}
+	if _, err := h.messages.Create(ctx, &domain.Message{
+		UserID: id, MessageType: domain.MessageText, Text: "Здравствуйте!",
+		Direction: domain.DirectionOutgoing, SenderType: domain.SenderAI,
+	}); err != nil {
+		t.Fatalf("seed bot reply: %v", err)
+	}
+	// A legacy row stored before sender_type existed must still render.
+	if _, err := h.db.ExecContext(ctx, `
+		INSERT INTO messages (user_id, whatsapp_message_id, trace_id, message_type, text,
+			media_id, caption, direction, processed, ai_processed, ai_intent, ai_confidence,
+			bot_responded, created_at, sender_type, sender_admin_id, media_path, media_mime,
+			media_name, media_size, delivery_status, reply_to, metadata)
+		VALUES (?, '', '', 'text', 'старое сообщение', '', '', 'outgoing', 1, 0, '', 0,
+			0, ?, '', 0, '', '', '', 0, '', '', '')`, id, time.Now().UTC()); err != nil {
+		t.Fatalf("seed legacy row: %v", err)
+	}
+
+	res, body := h.do(t, http.MethodGet, "/api/clients/"+itoa(id)+"/messages", nil)
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("messages: %d %v", res.StatusCode, body)
+	}
+	items, _ := body["items"].([]any)
+	if len(items) != 3 {
+		t.Fatalf("expected three messages, got %d", len(items))
+	}
+
+	want := []struct{ direction, sender string }{
+		{"inbound", "client"},
+		{"outbound", "ai"},
+		{"outbound", "ai"}, // legacy row: inferred from its direction, never from its text
+	}
+	for i, w := range want {
+		item, _ := items[i].(map[string]any)
+		if item["direction_type"] != w.direction || item["sender_type"] != w.sender {
+			t.Fatalf("message %d: got %v/%v, want %s/%s",
+				i, item["direction_type"], item["sender_type"], w.direction, w.sender)
+		}
+		if item["conversation_id"] != float64(id) {
+			t.Fatalf("message %d must name its conversation, got %v", i, item["conversation_id"])
+		}
+	}
+}
+
+func botEnabled(t *testing.T, body map[string]any) any {
+	t.Helper()
+	wa, ok := body["whatsapp"].(map[string]any)
+	if !ok {
+		t.Fatalf("the settings payload must carry a whatsapp section: %v", body)
+	}
+	return wa["bot_enabled"]
+}

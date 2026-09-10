@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -598,4 +599,57 @@ func TestDailyNewClientsToleratesUnparseableTimestamps(t *testing.T) {
 		t.Fatalf("a malformed timestamp must not become an empty day: %v", byDay)
 	}
 	_ = good
+}
+
+// The bot switch is a durable setting. It defaults to on so an existing
+// deployment keeps answering after the migration, and it survives a restart.
+func TestWhatsAppBotSwitchIsPersistedAndDefaultsToOn(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "settings.db")
+
+	db, err := Open(ctx, path)
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	settings := NewSettingsRepository(db)
+
+	enabled, err := settings.WhatsAppBotEnabled(ctx)
+	if err != nil {
+		t.Fatalf("read default: %v", err)
+	}
+	if !enabled {
+		t.Fatal("an unset switch must read as enabled")
+	}
+
+	if err := settings.SetWhatsAppBotEnabled(ctx, false, 7); err != nil {
+		t.Fatalf("disable: %v", err)
+	}
+	if enabled, err = settings.WhatsAppBotEnabled(ctx); err != nil || enabled {
+		t.Fatalf("the switch must read back as disabled: %v %v", enabled, err)
+	}
+	all, err := settings.All(ctx)
+	if err != nil {
+		t.Fatalf("all: %v", err)
+	}
+	if all[SettingWhatsAppBotEnabled] != "false" {
+		t.Fatalf("the raw setting must be stored, got %q", all[SettingWhatsAppBotEnabled])
+	}
+	db.Close()
+
+	// Reopening the same database is what a restart looks like.
+	reopened, err := Open(ctx, path)
+	if err != nil {
+		t.Fatalf("reopen db: %v", err)
+	}
+	defer reopened.Close()
+	if enabled, err = NewSettingsRepository(reopened).WhatsAppBotEnabled(ctx); err != nil || enabled {
+		t.Fatalf("the switch must survive a restart: %v %v", enabled, err)
+	}
+
+	if err := NewSettingsRepository(reopened).SetWhatsAppBotEnabled(ctx, true, 7); err != nil {
+		t.Fatalf("enable: %v", err)
+	}
+	if enabled, err = NewSettingsRepository(reopened).WhatsAppBotEnabled(ctx); err != nil || !enabled {
+		t.Fatalf("the switch must be re-enablable: %v %v", enabled, err)
+	}
 }

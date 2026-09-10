@@ -162,6 +162,7 @@ func (a *API) Routes() http.Handler {
 
 	mux.HandleFunc("GET /api/services", a.protected(a.handleServices))
 	mux.HandleFunc("GET /api/settings", a.protected(a.handleSettings))
+	mux.HandleFunc("PATCH /api/settings", a.protected(a.handleUpdateSettings))
 	mux.HandleFunc("GET /api/audit", a.protected(a.handleAudit))
 	mux.HandleFunc("GET /api/search", a.protected(a.handleSearch))
 	mux.HandleFunc("GET /api/export", a.protected(a.handleExport))
@@ -399,6 +400,10 @@ func (a *API) writeServiceError(w http.ResponseWriter, err error) {
 		writeJSON(w, http.StatusNotFound, errorBody("not found"))
 	case errors.Is(err, service.ErrNoFileSupport):
 		writeJSON(w, http.StatusBadRequest, errorBody("the configured WhatsApp provider cannot send files"))
+	case errors.Is(err, domain.ErrWhatsAppGroupChat):
+		writeJSON(w, http.StatusBadRequest, errorBody("cannot send to a WhatsApp group"))
+	case errors.Is(err, domain.ErrWhatsAppNonPrivateChat):
+		writeJSON(w, http.StatusBadRequest, errorBody("destination is not a private WhatsApp chat"))
 	case errors.Is(err, service.ErrUnsupportedMedia):
 		writeJSON(w, http.StatusUnsupportedMediaType, errorBody("this file type is not allowed"))
 	case errors.Is(err, service.ErrMediaTooLarge):

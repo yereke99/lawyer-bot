@@ -3,10 +3,15 @@ package whatsapp
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
+
+	"lawyer-bot/internal/domain"
 )
 
 func TestGreenClientSendTextUsesNativeSendMessage(t *testing.T) {
@@ -38,6 +43,38 @@ func TestGreenClientSendTextUsesNativeSendMessage(t *testing.T) {
 	}
 	if captured["message"] != "Здравствуйте" {
 		t.Fatalf("message = %q", captured["message"])
+	}
+}
+
+// A group destination is refused inside the client, before a request is built.
+// The provider must never see it, so the test server fails if it is reached.
+func TestGreenClientRejectsGroupRecipientBeforeAnyRequest(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Errorf("the provider was contacted for a group destination: %s", r.URL.Path)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	client := NewGreen(GreenOptions{IDInstance: "123", TokenInstance: "token", BaseURL: srv.URL})
+	group := "120363000000000000@g.us"
+
+	if _, err := client.SendText(context.Background(), group, "Здравствуйте"); !errors.Is(err, domain.ErrWhatsAppGroupChat) {
+		t.Fatalf("SendText must refuse a group recipient, got %v", err)
+	}
+
+	path := filepath.Join(t.TempDir(), "offer.pdf")
+	if err := os.WriteFile(path, []byte("%PDF-1.4"), 0o600); err != nil {
+		t.Fatalf("write file: %v", err)
+	}
+	if _, err := client.SendFile(context.Background(), group, domain.OutgoingFile{
+		Path: path, FileName: "offer.pdf", MimeType: "application/pdf",
+	}); !errors.Is(err, domain.ErrWhatsAppGroupChat) {
+		t.Fatalf("SendFile must refuse a group recipient, got %v", err)
+	}
+
+	// A broadcast list is not a private chat either.
+	if _, err := client.SendText(context.Background(), "status@broadcast", "Здравствуйте"); !errors.Is(err, domain.ErrWhatsAppNonPrivateChat) {
+		t.Fatalf("SendText must refuse a broadcast destination, got %v", err)
 	}
 }
 

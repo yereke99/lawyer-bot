@@ -1,6 +1,7 @@
 package admin
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -407,10 +408,67 @@ func (a *API) handleServices(w http.ResponseWriter, r *http.Request) {
 // It deliberately returns no secret: no OpenAI key, no WhatsApp token, no
 // instance credentials. Those live in the process environment and have no route.
 func (a *API) handleSettings(w http.ResponseWriter, r *http.Request) {
-	stored, err := a.settings.All(r.Context())
+	payload, err := a.settingsPayload(r.Context())
 	if err != nil {
 		a.log.Warn("load settings failed", zap.Error(err))
+	}
+	writeJSON(w, http.StatusOK, payload)
+}
+
+func (a *API) handleUpdateSettings(w http.ResponseWriter, r *http.Request) {
+	actor := actorFrom(r.Context())
+	if !actor.Role.CanAdminister() {
+		writeJSON(w, http.StatusForbidden, errorBody("only an administrator can change settings"))
+		return
+	}
+
+	var body struct {
+		WhatsAppBotEnabled *bool `json:"whatsapp_bot_enabled"`
+		WhatsApp           *struct {
+			BotEnabled *bool `json:"bot_enabled"`
+		} `json:"whatsapp"`
+	}
+	if err := decodeJSON(r, &body, 1<<16); err != nil {
+		writeJSON(w, http.StatusBadRequest, errorBody("invalid request"))
+		return
+	}
+
+	var changed []string
+	if body.WhatsAppBotEnabled != nil {
+		if err := a.settings.SetWhatsAppBotEnabled(r.Context(), *body.WhatsAppBotEnabled, actor.ID); err != nil {
+			a.writeServiceError(w, err)
+			return
+		}
+		changed = append(changed, fmt.Sprintf("whatsapp_bot_enabled=%t", *body.WhatsAppBotEnabled))
+	}
+	if body.WhatsApp != nil && body.WhatsApp.BotEnabled != nil {
+		if err := a.settings.SetWhatsAppBotEnabled(r.Context(), *body.WhatsApp.BotEnabled, actor.ID); err != nil {
+			a.writeServiceError(w, err)
+			return
+		}
+		changed = append(changed, fmt.Sprintf("whatsapp_bot_enabled=%t", *body.WhatsApp.BotEnabled))
+	}
+	if len(changed) == 0 {
+		writeJSON(w, http.StatusBadRequest, errorBody("no supported setting provided"))
+		return
+	}
+
+	a.recordAudit(r, actor, domain.AuditSettingsChange, "settings", 0, strings.Join(changed, ", "))
+	payload, err := a.settingsPayload(r.Context())
+	if err != nil {
+		a.log.Warn("load settings failed after update", zap.Error(err))
+	}
+	writeJSON(w, http.StatusOK, payload)
+}
+
+func (a *API) settingsPayload(ctx context.Context) (map[string]any, error) {
+	stored, err := a.settings.All(ctx)
+	if err != nil {
 		stored = map[string]string{}
+	}
+	botEnabled, botErr := a.settings.WhatsAppBotEnabled(ctx)
+	if botErr != nil {
+		err = botErr
 	}
 	cfg := a.cfg.FollowUp
 
@@ -419,7 +477,7 @@ func (a *API) handleSettings(w http.ResponseWriter, r *http.Request) {
 		delays = append(delays, d.String())
 	}
 
-	writeJSON(w, http.StatusOK, map[string]any{
+	return map[string]any{
 		"ai": map[string]any{
 			"reply_model":       a.cfg.Models.ReplyModel,
 			"classifier_model":  a.cfg.Models.ClassifierModel,
@@ -444,9 +502,14 @@ func (a *API) handleSettings(w http.ResponseWriter, r *http.Request) {
 			"max_upload_mb": a.cfg.MaxUploadSize / (1 << 20),
 			"media_enabled": a.media != nil,
 		},
+		"whatsapp": map[string]any{
+			"bot_enabled":       botEnabled,
+			"connection_status": "unknown",
+			"connection_note":   "Provider connection status is not exposed by this runtime API.",
+		},
 		"stored": stored,
 		"note":   "Secrets (OPENAI_API_KEY, Green API credentials) are read from the server environment and are never exposed here.",
-	})
+	}, err
 }
 
 func (a *API) handleAudit(w http.ResponseWriter, r *http.Request) {

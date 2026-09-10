@@ -25,8 +25,8 @@ import (
 // type, so an .ogg/opus upload arrives as a voice message, an image as a photo
 // and everything else as a document.
 func (c *GreenClient) SendFile(ctx context.Context, recipient string, file domain.OutgoingFile) (domain.SendResult, error) {
-	if strings.TrimSpace(recipient) == "" {
-		return domain.SendResult{}, fmt.Errorf("recipient is required")
+	if err := domain.ValidatePrivateWhatsAppRecipient(recipient); err != nil {
+		return domain.SendResult{}, err
 	}
 	if strings.TrimSpace(file.Path) == "" {
 		return domain.SendResult{}, fmt.Errorf("file path is required")

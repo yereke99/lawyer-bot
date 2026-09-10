@@ -17,20 +17,22 @@ import (
 
 // Trace stages added by the CRM layer.
 const (
-	StageCRMGate      = "crm_gate"
-	StageCRMState     = "crm_state_updated"
-	StageFollowUpPlan = "follow_up_scheduled"
-	StageMediaStored  = "media_stored"
+	StageWhatsAppChatGate = "whatsapp_chat_gate"
+	StageCRMGate          = "crm_gate"
+	StageCRMState         = "crm_state_updated"
+	StageFollowUpPlan     = "follow_up_scheduled"
+	StageMediaStored      = "media_stored"
 )
 
 // CRM gate reasons, recorded verbatim so silence is always explainable.
 const (
-	CRMReasonBlocked   = "client_blocked"
-	CRMReasonHumanMode = "human_takeover_active"
-	CRMReasonPaused    = "automation_paused"
-	CRMReasonAIOff     = "ai_disabled_for_client"
-	CRMReasonClosed    = "lead_closed"
-	CRMReasonOK        = "automation_allowed"
+	CRMReasonBlocked      = "client_blocked"
+	CRMReasonHumanMode    = "human_takeover_active"
+	CRMReasonPaused       = "automation_paused"
+	CRMReasonAIOff        = "ai_disabled_for_client"
+	CRMReasonClosed       = "lead_closed"
+	CRMReasonGlobalBotOff = "whatsapp_bot_disabled"
+	CRMReasonOK           = "automation_allowed"
 )
 
 // crmGate decides whether automation may answer this client.
@@ -56,6 +58,18 @@ func crmGate(client *domain.CRMClient) (string, bool) {
 	default:
 		return CRMReasonOK, true
 	}
+}
+
+func (p *Pipeline) whatsappBotEnabled(ctx context.Context, log *zap.Logger) bool {
+	if p.settings == nil {
+		return true
+	}
+	enabled, err := p.settings.WhatsAppBotEnabled(ctx)
+	if err != nil {
+		log.Warn("load whatsapp bot setting failed", zap.Error(err))
+		return true
+	}
+	return enabled
 }
 
 // onInbound records the client-side effects of a received message: activity

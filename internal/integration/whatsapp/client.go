@@ -62,8 +62,8 @@ func New(opts Options) *Client {
 // SendText sends a plain text message. It is only ever called in reply to an
 // incoming message: nothing in this package can start a conversation on its own.
 func (c *Client) SendText(ctx context.Context, recipient, text string) (domain.SendResult, error) {
-	if recipient == "" {
-		return domain.SendResult{}, fmt.Errorf("recipient is required")
+	if err := domain.ValidatePrivateWhatsAppRecipient(recipient); err != nil {
+		return domain.SendResult{}, err
 	}
 	if strings.TrimSpace(text) == "" {
 		return domain.SendResult{}, fmt.Errorf("empty message text")
@@ -84,8 +84,8 @@ func (c *Client) SendText(ctx context.Context, recipient, text string) (domain.S
 
 // SendMedia sends a previously uploaded media object with an optional caption.
 func (c *Client) SendMedia(ctx context.Context, recipient, mediaID, caption string) (domain.SendResult, error) {
-	if recipient == "" {
-		return domain.SendResult{}, fmt.Errorf("recipient is required")
+	if err := domain.ValidatePrivateWhatsAppRecipient(recipient); err != nil {
+		return domain.SendResult{}, err
 	}
 	if mediaID == "" {
 		return domain.SendResult{}, fmt.Errorf("media id is required")

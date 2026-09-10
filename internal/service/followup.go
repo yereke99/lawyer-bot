@@ -115,6 +115,7 @@ type FollowUpService struct {
 	crm      *repository.CRMRepository
 	messages *repository.MessageRepository
 	trace    *repository.TraceRepository
+	settings *repository.SettingsRepository
 	sender   *Messenger
 	log      *zap.Logger
 	cfg      FollowUpConfig
@@ -126,6 +127,7 @@ type FollowUpDeps struct {
 	CRM      *repository.CRMRepository
 	Messages *repository.MessageRepository
 	Trace    *repository.TraceRepository
+	Settings *repository.SettingsRepository
 	Sender   *Messenger
 	Logger   *zap.Logger
 }
@@ -141,6 +143,7 @@ func NewFollowUpService(deps FollowUpDeps, cfg FollowUpConfig) *FollowUpService 
 		crm:      deps.CRM,
 		messages: deps.Messages,
 		trace:    deps.Trace,
+		settings: deps.Settings,
 		sender:   deps.Sender,
 		log:      log,
 		cfg:      cfg.Normalise(),
@@ -176,6 +179,11 @@ func (s *FollowUpService) CancelFor(ctx context.Context, userID int64, reason st
 // two concurrent pipeline runs for the same message cannot produce two nudges.
 func (s *FollowUpService) Schedule(ctx context.Context, client *domain.CRMClient, stage int, anchorMessageID int64) error {
 	if s == nil || !s.cfg.Enabled || s.jobs == nil {
+		return nil
+	}
+	if !s.whatsappBotEnabled(ctx) {
+		s.log.Info("follow-up scheduling skipped because whatsapp bot is disabled",
+			zap.Int64("client_id", clientIDOf(client)))
 		return nil
 	}
 	if client == nil || !client.AutomationAllowed() {
@@ -340,6 +348,10 @@ func (s *FollowUpService) process(ctx context.Context, job domain.FollowUpJob, t
 // the nudge must not be delivered.
 func (s *FollowUpService) blocked(ctx context.Context, client *domain.CRMClient, job domain.FollowUpJob) (string, bool) {
 	switch {
+	case !s.whatsappBotEnabled(ctx):
+		return "whatsapp bot disabled", false
+	case !domain.IsPrivateWhatsAppChat(client.WhatsAppUserID):
+		return "non-private whatsapp chat", false
 	case client.Blocked:
 		return "client is blocked", false
 	case !client.AIEnabled:
@@ -360,6 +372,25 @@ func (s *FollowUpService) blocked(ctx context.Context, client *domain.CRMClient,
 		return "client already replied", false
 	}
 	return "", true
+}
+
+func (s *FollowUpService) whatsappBotEnabled(ctx context.Context) bool {
+	if s == nil || s.settings == nil {
+		return true
+	}
+	enabled, err := s.settings.WhatsAppBotEnabled(ctx)
+	if err != nil {
+		s.log.Warn("load whatsapp bot setting failed", zap.Error(err))
+		return true
+	}
+	return enabled
+}
+
+func clientIDOf(client *domain.CRMClient) int64 {
+	if client == nil {
+		return 0
+	}
+	return client.ID
 }
 
 func (s *FollowUpService) finish(ctx context.Context, log *zap.Logger, job domain.FollowUpJob,

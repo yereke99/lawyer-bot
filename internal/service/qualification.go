@@ -31,6 +31,7 @@ type Pipeline struct {
 	leads    *repository.LeadRepository
 	aiLog    *repository.AIInteractionRepository
 	trace    *repository.TraceRepository
+	settings *repository.SettingsRepository
 
 	ai       domain.AIClient
 	agent    domain.AIReplyClient
@@ -73,6 +74,7 @@ type PipelineDeps struct {
 	Leads    *repository.LeadRepository
 	AILog    *repository.AIInteractionRepository
 	Trace    *repository.TraceRepository
+	Settings *repository.SettingsRepository
 
 	AI       domain.AIClient
 	Agent    domain.AIReplyClient
@@ -93,6 +95,10 @@ type PipelineDeps struct {
 
 // NewPipeline builds a Pipeline.
 func NewPipeline(deps PipelineDeps, cfg PipelineConfig) *Pipeline {
+	log := deps.Logger
+	if log == nil {
+		log = zap.NewNop()
+	}
 	if cfg.DefaultSource == "" {
 		cfg.DefaultSource = domain.SourceWhatsApp
 	}
@@ -112,6 +118,7 @@ func NewPipeline(deps PipelineDeps, cfg PipelineConfig) *Pipeline {
 		leads:    deps.Leads,
 		aiLog:    deps.AILog,
 		trace:    deps.Trace,
+		settings: deps.Settings,
 		ai:       deps.AI,
 		agent:    agent,
 		wa:       deps.WhatsApp,
@@ -120,7 +127,7 @@ func NewPipeline(deps PipelineDeps, cfg PipelineConfig) *Pipeline {
 		composer: deps.Composer,
 		qualify:  deps.Qualify,
 		triggers: deps.Triggers,
-		log:      deps.Logger,
+		log:      log,
 		clients:  deps.Clients,
 		follow:   deps.FollowUp,
 		media:    deps.Media,
@@ -155,6 +162,22 @@ func (p *Pipeline) Handle(ctx context.Context, in domain.InboundMessage) error {
 		zap.String("whatsapp_message_id", in.WhatsAppMessageID),
 		logger.Phone("phone", in.PhoneNumber),
 	)
+
+	if !domain.IsPrivateWhatsAppChat(in.WhatsAppUserID) {
+		reason := "non_private_whatsapp_chat"
+		if domain.IsGroupWhatsAppChat(in.WhatsAppUserID) {
+			reason = "whatsapp_group_chat"
+		}
+		p.event(ctx, domain.TraceEvent{TraceID: in.TraceID,
+			Stage: StageWhatsAppChatGate, Decision: domain.DecisionSilent,
+			Reason: reason, Detail: repository.Detail(map[string]any{
+				"chat_id": in.WhatsAppUserID, "provider_message_id": in.WhatsAppMessageID,
+			})})
+		log.Info("incoming whatsapp message ignored before pipeline",
+			zap.String("reason", reason),
+			zap.String("chat_id", in.WhatsAppUserID))
+		return nil
+	}
 
 	duplicate, err := p.messages.ExistsByWhatsAppID(ctx, in.WhatsAppMessageID)
 	if err != nil {
@@ -219,6 +242,7 @@ func (p *Pipeline) Handle(ctx context.Context, in domain.InboundMessage) error {
 		MediaID:           in.MediaID,
 		Caption:           in.Caption,
 		Direction:         domain.DirectionIncoming,
+		SenderType:        domain.SenderClient,
 		CreatedAt:         in.Timestamp,
 	}
 	messageID, err := p.messages.Create(ctx, msg)
@@ -260,6 +284,20 @@ func (p *Pipeline) Handle(ctx context.Context, in domain.InboundMessage) error {
 	// -------------------------------------------- 3. CRM: client replied
 	// Activity, unread badge and cancellation of every now-obsolete follow-up.
 	p.onInbound(ctx, log, user.ID, in.Timestamp)
+
+	if !p.whatsappBotEnabled(ctx, log) {
+		reason := CRMReasonGlobalBotOff
+		p.event(ctx, domain.TraceEvent{TraceID: in.TraceID, UserID: user.ID, MessageID: messageID,
+			Stage: StageCRMGate, Decision: domain.DecisionSilent, Reason: reason})
+		if err := p.messages.MarkProcessed(ctx, messageID, false, "", 0, false); err != nil {
+			log.Warn("mark message processed failed", zap.Error(err))
+		}
+		p.event(ctx, domain.TraceEvent{TraceID: in.TraceID, UserID: user.ID, MessageID: messageID,
+			Stage: domain.StagePipelineDone, Decision: domain.DecisionSilent,
+			Reason: reason, DurationMS: time.Since(started).Milliseconds()})
+		log.Info("whatsapp bot automation disabled globally")
+		return nil
+	}
 
 	// The CRM gate runs before any token is spent. A blocked client, a closed
 	// lead, a paused conversation or one a consultant has taken over is stored

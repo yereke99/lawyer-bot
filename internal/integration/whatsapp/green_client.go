@@ -59,8 +59,8 @@ func NewGreen(opts GreenOptions) *GreenClient {
 
 // SendText sends a plain text message through Green API sendMessage.
 func (c *GreenClient) SendText(ctx context.Context, recipient, text string) (domain.SendResult, error) {
-	if strings.TrimSpace(recipient) == "" {
-		return domain.SendResult{}, fmt.Errorf("recipient is required")
+	if err := domain.ValidatePrivateWhatsAppRecipient(recipient); err != nil {
+		return domain.SendResult{}, err
 	}
 	if strings.TrimSpace(text) == "" {
 		return domain.SendResult{}, fmt.Errorf("empty message text")

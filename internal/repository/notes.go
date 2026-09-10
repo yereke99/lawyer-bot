@@ -189,6 +189,8 @@ type SettingsRepository struct {
 	db *DB
 }
 
+const SettingWhatsAppBotEnabled = "whatsapp_bot_enabled"
+
 // NewSettingsRepository builds a SettingsRepository.
 func NewSettingsRepository(db *DB) *SettingsRepository { return &SettingsRepository{db: db} }
 
@@ -235,4 +237,35 @@ func (r *SettingsRepository) Set(ctx context.Context, key, value string, adminID
 		return fmt.Errorf("store setting %q: %w", key, err)
 	}
 	return nil
+}
+
+// WhatsAppBotEnabled is the global runtime switch for automatic WhatsApp bot
+// processing. Missing rows default to enabled to preserve existing production
+// behaviour after a migration.
+func (r *SettingsRepository) WhatsAppBotEnabled(ctx context.Context) (bool, error) {
+	value, err := r.Get(ctx, SettingWhatsAppBotEnabled, "true")
+	if err != nil {
+		return true, err
+	}
+	return parseBoolSetting(value, true), nil
+}
+
+// SetWhatsAppBotEnabled persists the global automatic-processing switch.
+func (r *SettingsRepository) SetWhatsAppBotEnabled(ctx context.Context, enabled bool, adminID int64) error {
+	value := "false"
+	if enabled {
+		value = "true"
+	}
+	return r.Set(ctx, SettingWhatsAppBotEnabled, value, adminID)
+}
+
+func parseBoolSetting(value string, def bool) bool {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "1", "true", "yes", "on", "enabled":
+		return true
+	case "0", "false", "no", "off", "disabled":
+		return false
+	default:
+		return def
+	}
 }

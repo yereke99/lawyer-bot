@@ -57,7 +57,7 @@ func newCRMHarness(t *testing.T, ai *stubAI, followCfg FollowUpConfig) *crmHarne
 
 	follow := NewFollowUpService(FollowUpDeps{
 		Jobs: jobs, CRM: clients, Messages: base.messages, Trace: base.trace,
-		Sender: messenger, Logger: zap.NewNop(),
+		Settings: base.settings, Sender: messenger, Logger: zap.NewNop(),
 	}, followCfg)
 
 	auth := NewAuthService(adminRepo, audit, zap.NewNop(), AuthConfig{
@@ -83,6 +83,7 @@ func newCRMHarness(t *testing.T, ai *stubAI, followCfg FollowUpConfig) *crmHarne
 		Leads:    base.leads,
 		AILog:    repository.NewAIInteractionRepository(base.db),
 		Trace:    base.trace,
+		Settings: base.settings,
 		AI:       ai,
 		WhatsApp: base.wa,
 		Gate: NewGate(triggers, GateConfig{
@@ -153,6 +154,17 @@ func (h *crmHarness) actor() Actor {
 	return Actor{ID: 1, Name: "Диана", Role: domain.RoleConsultant}
 }
 
+// jobOutcome reads how the follow-up worker closed a job, so a test can assert
+// the recorded reason and not merely the absence of a send.
+func (h *crmHarness) jobOutcome(t *testing.T, jobID int64) (status, note string) {
+	t.Helper()
+	if err := h.db.QueryRowContext(context.Background(),
+		`SELECT status, last_error FROM follow_up_jobs WHERE id = ?`, jobID).Scan(&status, &note); err != nil {
+		t.Fatalf("load follow-up job %d: %v", jobID, err)
+	}
+	return status, note
+}
+
 // ---------------------------------------------------------------- scenarios
 
 // Scenarios 1, 4, 5: a new Russian message creates a client, is understood as a
@@ -220,6 +232,284 @@ func TestDuplicateInboundIsProcessedOnceWithCRM(t *testing.T) {
 	client := h.client(t, msg.WhatsAppUserID)
 	if client.UnreadCount != 1 {
 		t.Fatalf("a duplicate must not inflate the unread badge, got %d", client.UnreadCount)
+	}
+}
+
+func TestGroupInboundIsIgnoredBeforeStoreAndReply(t *testing.T) {
+	ai := &stubAI{results: []domain.AIClassification{trademarkResult()}}
+	h := newCRMHarness(t, ai, testFollowUpConfig())
+	ctx := context.Background()
+
+	msg := inbound("green.group.1", "нужен товарный знак")
+	msg.WhatsAppUserID = "120363000000000000@g.us"
+	msg.PhoneNumber = "77015551234"
+	msg.TraceID = "trace-group"
+	if err := h.pipeline.Handle(ctx, msg); err != nil {
+		t.Fatalf("handle group: %v", err)
+	}
+
+	if ai.callCount() != 0 {
+		t.Fatal("a group message must not reach OpenAI")
+	}
+	if len(h.wa.messages()) != 0 {
+		t.Fatal("a group message must not produce an outbound WhatsApp message")
+	}
+	var stored int
+	if err := h.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM messages`).Scan(&stored); err != nil {
+		t.Fatalf("count messages: %v", err)
+	}
+	if stored != 0 {
+		t.Fatalf("a group message must not be stored as a client conversation, got %d rows", stored)
+	}
+	if !hasStage(h.stages(t, "trace-group"), StageWhatsAppChatGate) {
+		t.Fatal("group suppression must be traced")
+	}
+}
+
+func TestGlobalBotOffStoresInboundButSkipsAutomationAndAllowsManualReply(t *testing.T) {
+	ai := &stubAI{results: []domain.AIClassification{trademarkResult()}}
+	h := newCRMHarness(t, ai, testFollowUpConfig())
+	ctx := context.Background()
+
+	if err := h.settings.SetWhatsAppBotEnabled(ctx, false, 1); err != nil {
+		t.Fatalf("disable bot: %v", err)
+	}
+
+	msg := inbound("wamid.off1", "нужен товарный знак")
+	msg.TraceID = "trace-bot-off"
+	if err := h.pipeline.Handle(ctx, msg); err != nil {
+		t.Fatalf("handle with bot off: %v", err)
+	}
+
+	client := h.client(t, msg.WhatsAppUserID)
+	if client.UnreadCount != 1 {
+		t.Fatalf("incoming message must still be visible in CRM, unread=%d", client.UnreadCount)
+	}
+	if ai.callCount() != 0 {
+		t.Fatal("bot off must stop trigger/AI processing")
+	}
+	if len(h.wa.messages()) != 0 {
+		t.Fatal("bot off must stop automatic replies")
+	}
+	stored, _, err := h.messages.PageByUser(ctx, client.ID, 0, 10)
+	if err != nil {
+		t.Fatalf("load messages: %v", err)
+	}
+	if len(stored) != 1 || stored[0].Direction != domain.DirectionIncoming ||
+		stored[0].SenderType != domain.SenderClient {
+		t.Fatalf("incoming message direction/sender wrong: %+v", stored)
+	}
+
+	manual, err := h.crm.SendMessage(ctx, h.actor(), client.ID, "Здравствуйте, я подключилась.", nil)
+	if err != nil {
+		t.Fatalf("manual reply must still work when bot is off: %v", err)
+	}
+	if manual.Direction != domain.DirectionOutgoing || manual.SenderType != domain.SenderConsultant {
+		t.Fatalf("manual reply attribution wrong: %+v", manual)
+	}
+	if len(h.wa.messages()) != 1 {
+		t.Fatal("manual reply should still be sent through WhatsApp")
+	}
+}
+
+// Switching the bot back on restores automatic handling for the next message.
+// Messages received while it was off are not replayed: the switch pauses the
+// assistant, it does not queue work for it.
+func TestAutomationResumesWhenTheBotIsSwitchedBackOn(t *testing.T) {
+	ai := &stubAI{results: []domain.AIClassification{trademarkResult()}}
+	h := newCRMHarness(t, ai, testFollowUpConfig())
+	ctx := context.Background()
+
+	if err := h.settings.SetWhatsAppBotEnabled(ctx, false, 1); err != nil {
+		t.Fatalf("disable bot: %v", err)
+	}
+	if err := h.pipeline.Handle(ctx, inbound("wamid.resume1", "нужен товарный знак")); err != nil {
+		t.Fatalf("handle while off: %v", err)
+	}
+	if ai.callCount() != 0 || len(h.wa.messages()) != 0 {
+		t.Fatal("nothing may be automated while the bot is off")
+	}
+
+	if err := h.settings.SetWhatsAppBotEnabled(ctx, true, 1); err != nil {
+		t.Fatalf("enable bot: %v", err)
+	}
+	if ai.callCount() != 0 || len(h.wa.messages()) != 0 {
+		t.Fatal("switching the bot on must not replay messages received while it was off")
+	}
+
+	if err := h.pipeline.Handle(ctx, inbound("wamid.resume2", "нужен товарный знак")); err != nil {
+		t.Fatalf("handle after re-enabling: %v", err)
+	}
+	if ai.callCount() != 1 {
+		t.Fatalf("the next message must be analysed again, got %d calls", ai.callCount())
+	}
+	if len(h.wa.messages()) != 1 {
+		t.Fatalf("the next message must be answered again, got %d sends", len(h.wa.messages()))
+	}
+}
+
+// A trigger the client typed with padding, line breaks and shouting still
+// starts the flow: normalisation is case- and whitespace-insensitive but never
+// rewrites the words themselves.
+func TestPaddedAndShoutedTriggerStartsTheFlow(t *testing.T) {
+	for _, tc := range []struct{ name, text string }{
+		{"padding and case", "   НУЖЕН\n\n  Товарный   Знак  "},
+		{"kazakh", "  Маған ТАУАР белгісін тіркеу керек  "},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ai := &stubAI{results: []domain.AIClassification{trademarkResult()}}
+			h := newCRMHarness(t, ai, testFollowUpConfig())
+			ctx := context.Background()
+
+			if !NewTriggerSet().Match(tc.text).Matched {
+				t.Fatalf("the deterministic filter must recognise %q", tc.text)
+			}
+
+			msg := inbound("wamid.trigger."+tc.name, tc.text)
+			msg.TraceID = "trace-" + tc.name
+			if err := h.pipeline.Handle(ctx, msg); err != nil {
+				t.Fatalf("handle: %v", err)
+			}
+
+			if ai.callCount() != 1 {
+				t.Fatalf("a valid trigger must reach the model exactly once, got %d calls", ai.callCount())
+			}
+			if len(h.wa.messages()) != 1 {
+				t.Fatalf("a valid trigger must produce one reply, got %d", len(h.wa.messages()))
+			}
+
+			client := h.client(t, msg.WhatsAppUserID)
+			if !client.CurrentState.Active() {
+				t.Fatalf("the qualification flow must be initialised, state=%q", client.CurrentState)
+			}
+
+			stored, _, err := h.messages.PageByUser(ctx, client.ID, 0, 10)
+			if err != nil {
+				t.Fatalf("load messages: %v", err)
+			}
+			if len(stored) != 2 {
+				t.Fatalf("the client message and the reply must both be stored, got %d", len(stored))
+			}
+			// The stored text keeps the client's own words, untouched.
+			if stored[0].Text != tc.text {
+				t.Fatalf("the incoming text must be stored verbatim, got %q", stored[0].Text)
+			}
+			if stored[0].Direction != domain.DirectionIncoming || stored[0].SenderType != domain.SenderClient {
+				t.Fatalf("incoming attribution wrong: %s/%s", stored[0].Direction, stored[0].SenderType)
+			}
+			if stored[1].Direction != domain.DirectionOutgoing || stored[1].SenderType != domain.SenderAI {
+				t.Fatalf("automatic reply attribution wrong: %s/%s", stored[1].Direction, stored[1].SenderType)
+			}
+		})
+	}
+}
+
+// The shared outbound layer is the last line of defence: a group destination is
+// refused before the provider client is reached and nothing is stored.
+func TestOutboundLayerRefusesGroupRecipient(t *testing.T) {
+	h := newCRMHarness(t, &stubAI{}, testFollowUpConfig())
+	ctx := context.Background()
+
+	_, err := h.messenger.Send(ctx, Outbound{
+		Recipient: "120363000000000000@g.us",
+		Sender:    domain.SenderAI,
+		Text:      "Здравствуйте",
+	})
+	if !errors.Is(err, domain.ErrWhatsAppGroupChat) {
+		t.Fatalf("the outbound layer must refuse a group destination, got %v", err)
+	}
+	if len(h.wa.messages()) != 0 {
+		t.Fatal("nothing may reach the provider for a group destination")
+	}
+	if h.outgoingCount(t) != 0 {
+		t.Fatal("a refused group send must not be stored as an outgoing message")
+	}
+
+	if _, err := h.messenger.SendRaw(ctx, "120363000000000000@g.us", "Здравствуйте"); !errors.Is(err, domain.ErrWhatsAppGroupChat) {
+		t.Fatalf("SendRaw must refuse a group destination, got %v", err)
+	}
+	if len(h.wa.messages()) != 0 {
+		t.Fatal("SendRaw must not reach the provider for a group destination")
+	}
+}
+
+// A nudge scheduled while the bot was on must not be delivered after an
+// administrator turns the bot off: the worker re-reads the switch at send time.
+func TestFollowUpIsSkippedAfterTheBotIsDisabled(t *testing.T) {
+	ai := &stubAI{results: []domain.AIClassification{trademarkResult()}}
+	cfg := testFollowUpConfig()
+	cfg.Delays = []time.Duration{-time.Minute, 6 * time.Hour}
+	h := newCRMHarness(t, ai, cfg)
+	ctx := context.Background()
+
+	if err := h.pipeline.Handle(ctx, inbound("wamid.fuoff1", "нужен товарный знак")); err != nil {
+		t.Fatalf("handle: %v", err)
+	}
+	client := h.client(t, "77015551234")
+	job, err := h.jobs.NextPendingForUser(ctx, client.ID)
+	if err != nil {
+		t.Fatalf("a nudge should be scheduled while the bot is on: %v", err)
+	}
+	before := len(h.wa.messages())
+
+	if err := h.settings.SetWhatsAppBotEnabled(ctx, false, 1); err != nil {
+		t.Fatalf("disable bot: %v", err)
+	}
+	if err := h.follow.RunOnce(ctx); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+
+	if len(h.wa.messages()) != before {
+		t.Fatal("a follow-up must not be sent while the bot is globally disabled")
+	}
+	status, note := h.jobOutcome(t, job.ID)
+	if status != string(domain.FollowUpSkipped) {
+		t.Fatalf("the job must be closed as skipped, got %q", status)
+	}
+	if !strings.Contains(note, "bot disabled") {
+		t.Fatalf("the skip reason must name the global switch, got %q", note)
+	}
+
+	// Scheduling is refused too, so a disabled bot never accumulates a backlog.
+	if err := h.follow.Schedule(ctx, client, 1, job.MessageID); err != nil {
+		t.Fatalf("schedule while disabled: %v", err)
+	}
+	if _, err := h.jobs.NextPendingForUser(ctx, client.ID); !errors.Is(err, repository.ErrNotFound) {
+		t.Fatalf("no nudge may be scheduled while the bot is disabled, got %v", err)
+	}
+}
+
+// A legacy conversation whose WhatsApp identity is a group can never be nudged.
+func TestFollowUpNeverTargetsAGroupChat(t *testing.T) {
+	cfg := testFollowUpConfig()
+	cfg.Delays = []time.Duration{-time.Minute}
+	h := newCRMHarness(t, &stubAI{}, cfg)
+	ctx := context.Background()
+
+	group, err := h.users.Upsert(ctx, "120363000000000000@g.us", "77015551234", "Рабочий чат")
+	if err != nil {
+		t.Fatalf("seed group conversation: %v", err)
+	}
+	job, _, err := h.jobs.Schedule(ctx, domain.FollowUpJob{
+		UserID: group.ID, Stage: 1, ScheduledAt: time.Now().UTC().Add(-time.Minute),
+		DedupeKey: "group-follow-up-test",
+	})
+	if err != nil {
+		t.Fatalf("schedule: %v", err)
+	}
+
+	if err := h.follow.RunOnce(ctx); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if len(h.wa.messages()) != 0 {
+		t.Fatal("no scheduled message may ever be sent to a group chat")
+	}
+	status, note := h.jobOutcome(t, job)
+	if status != string(domain.FollowUpSkipped) {
+		t.Fatalf("the job must be closed as skipped, got %q", status)
+	}
+	if !strings.Contains(note, "non-private") {
+		t.Fatalf("the skip reason must name the chat kind, got %q", note)
 	}
 }
 
