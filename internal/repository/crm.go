@@ -756,10 +756,19 @@ type DailyCount struct {
 }
 
 // DailyNewClients returns new clients per day for the analytics chart.
+//
+// The day is taken with substr rather than SQLite's date(): the driver stores a
+// timestamp as text like "2026-09-10 09:21:22.999999999+00:00", and date()
+// returns NULL for any value it cannot parse, which used to fail the scan and
+// break the whole analytics screen. The first ten characters are the calendar
+// day for every layout the driver writes, whether the separator is a space or a
+// "T", and everything is stored in UTC. Rows are still filtered on the raw
+// column, so the index on created_at is used.
 func (r *CRMRepository) DailyNewClients(ctx context.Context, since time.Time) ([]DailyCount, error) {
 	rows, err := r.db.QueryContext(ctx, `
-		SELECT date(created_at) AS d, COUNT(*) FROM users
-		WHERE created_at >= ? GROUP BY d ORDER BY d ASC`, since)
+		SELECT substr(created_at, 1, 10) AS d, COUNT(*) FROM users
+		WHERE created_at >= ? AND created_at <> ''
+		GROUP BY d ORDER BY d ASC`, since)
 	if err != nil {
 		return nil, fmt.Errorf("daily new clients: %w", err)
 	}
@@ -767,11 +776,19 @@ func (r *CRMRepository) DailyNewClients(ctx context.Context, since time.Time) ([
 
 	var out []DailyCount
 	for rows.Next() {
-		var d DailyCount
-		if err := rows.Scan(&d.Day, &d.Count); err != nil {
+		var (
+			day   sql.NullString
+			count int
+		)
+		// A malformed timestamp must never take the analytics page down, so a
+		// NULL day is tolerated here and skipped below.
+		if err := rows.Scan(&day, &count); err != nil {
 			return nil, fmt.Errorf("scan daily count: %w", err)
 		}
-		out = append(out, d)
+		if !day.Valid || len(day.String) != 10 {
+			continue
+		}
+		out = append(out, DailyCount{Day: day.String, Count: count})
 	}
 	return out, rows.Err()
 }

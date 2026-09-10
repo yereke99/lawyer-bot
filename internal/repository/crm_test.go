@@ -3,6 +3,7 @@ package repository
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"sync"
 	"testing"
@@ -543,4 +544,58 @@ func TestInternalNotesLifecycle(t *testing.T) {
 	if _, err := notes.Get(ctx, note.ID); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("deleted note must not be readable, err=%v", err)
 	}
+}
+
+// The analytics series must survive a timestamp the driver wrote in a layout
+// SQLite's date() cannot parse. This is the regression for a scan that failed
+// with "converting NULL to string is unsupported" and took the whole analytics
+// screen down.
+func TestDailyNewClientsToleratesUnparseableTimestamps(t *testing.T) {
+	ctx := context.Background()
+	db, crm, users := newCRMTestDB(t)
+
+	good := mustClient(t, users, "wa-day-good", "77010000020", "Good")
+
+	// Layouts the driver has produced across versions, plus one value SQLite's
+	// date() rejects outright.
+	layouts := []string{
+		"2026-09-08 10:00:00.999719903+00:00", // modernc: space separator, 9 fractional digits
+		"2026-09-08T11:00:00.196816+00:00",    // T separator, 6 fractional digits
+		"2026-09-09 12:00:00+00:00",           // no fractional part
+		"not-a-timestamp",                     // date() returns NULL for this
+	}
+	for i, raw := range layouts {
+		if _, err := db.ExecContext(ctx, `
+			INSERT INTO users (whatsapp_user_id, phone_number, display_name, language,
+				current_state, detected_service, lead_score, is_lead,
+				first_seen_at, last_seen_at, created_at, updated_at)
+			VALUES (?, '', '', '', 'new', '', 0, 0, ?, ?, ?, ?)`,
+			fmt.Sprintf("wa-day-%d", i), raw, raw, raw, raw); err != nil {
+			t.Fatalf("insert row %d: %v", i, err)
+		}
+	}
+
+	series, err := crm.DailyNewClients(ctx, time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC))
+	if err != nil {
+		t.Fatalf("daily new clients must not fail on an odd timestamp: %v", err)
+	}
+
+	byDay := map[string]int{}
+	for _, point := range series {
+		if len(point.Day) != 10 {
+			t.Fatalf("a series point must be a calendar day, got %q", point.Day)
+		}
+		byDay[point.Day] = point.Count
+	}
+	if byDay["2026-09-08"] != 2 {
+		t.Fatalf("both 8 September rows must be counted regardless of layout: %v", byDay)
+	}
+	if byDay["2026-09-09"] != 1 {
+		t.Fatalf("the 9 September row is missing: %v", byDay)
+	}
+	// The unparseable row is skipped, never surfaced as an empty bucket.
+	if _, ok := byDay[""]; ok {
+		t.Fatalf("a malformed timestamp must not become an empty day: %v", byDay)
+	}
+	_ = good
 }
