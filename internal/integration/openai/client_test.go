@@ -351,7 +351,23 @@ func TestLongInputIsTruncated(t *testing.T) {
 	messages, _ := captured["messages"].([]any)
 	last, _ := messages[len(messages)-1].(map[string]any)
 	content, _ := last["content"].(string)
-	if len([]rune(content)) > 50 {
-		t.Fatalf("input should be truncated to the configured limit, got %d runes", len([]rune(content)))
+
+	// The customer's text is wrapped in untrusted-data markers, so the limit
+	// applies to the fenced payload rather than to the application's framing.
+	customer := fencedCustomerText(t, content)
+	if len([]rune(customer)) > 50 {
+		t.Fatalf("input should be truncated to the configured limit, got %d runes", len([]rune(customer)))
 	}
+}
+
+// fencedCustomerText extracts the customer payload from the untrusted-data fence.
+func fencedCustomerText(t *testing.T, content string) string {
+	t.Helper()
+	const open, closeMarker = "<<<CUSTOMER_MESSAGE\n", "\nCUSTOMER_MESSAGE>>>"
+	start := strings.Index(content, open)
+	end := strings.LastIndex(content, closeMarker)
+	if start < 0 || end < 0 {
+		t.Fatalf("customer message is not fenced as untrusted data: %q", content)
+	}
+	return content[start+len(open) : end]
 }

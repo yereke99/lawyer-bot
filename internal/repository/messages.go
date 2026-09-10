@@ -29,22 +29,29 @@ func NewMessageRepository(db *DB) *MessageRepository {
 
 const messageColumns = `id, user_id, whatsapp_message_id, trace_id, message_type, text,
 	media_id, caption, direction, processed, ai_processed, ai_intent,
-	ai_confidence, bot_responded, created_at`
+	ai_confidence, bot_responded, created_at, sender_type, sender_admin_id,
+	media_path, media_mime, media_name, media_size, delivery_status, reply_to, metadata`
 
 // Create stores a message and returns its assigned ID.
 func (r *MessageRepository) Create(ctx context.Context, m *domain.Message) (int64, error) {
 	if m.CreatedAt.IsZero() {
 		m.CreatedAt = time.Now().UTC()
 	}
+	if m.SenderType == "" {
+		m.SenderType = m.SenderOrDefault()
+	}
 	res, err := r.db.ExecContext(ctx, `
 		INSERT INTO messages (user_id, whatsapp_message_id, trace_id, message_type, text,
 			media_id, caption, direction, processed, ai_processed, ai_intent,
-			ai_confidence, bot_responded, created_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			ai_confidence, bot_responded, created_at, sender_type, sender_admin_id,
+			media_path, media_mime, media_name, media_size, delivery_status, reply_to, metadata)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		m.UserID, m.WhatsAppMessageID, m.TraceID, string(m.MessageType), m.Text,
 		m.MediaID, m.Caption, string(m.Direction), boolToInt(m.Processed),
 		boolToInt(m.AIProcessed), m.AIIntent, m.AIConfidence,
-		boolToInt(m.BotResponded), m.CreatedAt)
+		boolToInt(m.BotResponded), m.CreatedAt, string(m.SenderType), m.SenderAdminID,
+		m.MediaPath, m.MediaMime, m.MediaName, m.MediaSize, m.DeliveryStatus,
+		m.ReplyTo, truncate(m.Metadata, 4000))
 	if err != nil {
 		if m.WhatsAppMessageID != "" && isUniqueConstraint(err) {
 			return 0, fmt.Errorf("%w: %s", ErrDuplicateWhatsAppMessage, m.WhatsAppMessageID)
@@ -167,12 +174,16 @@ func scanMessage(rows *sql.Rows) (domain.Message, error) {
 		aiProcessed  int
 		botResponded int
 	)
+	var senderType string
 	err := rows.Scan(&m.ID, &m.UserID, &m.WhatsAppMessageID, &m.TraceID, &msgType, &m.Text,
 		&m.MediaID, &m.Caption, &direction, &processed, &aiProcessed, &m.AIIntent,
-		&m.AIConfidence, &botResponded, &m.CreatedAt)
+		&m.AIConfidence, &botResponded, &m.CreatedAt, &senderType, &m.SenderAdminID,
+		&m.MediaPath, &m.MediaMime, &m.MediaName, &m.MediaSize, &m.DeliveryStatus,
+		&m.ReplyTo, &m.Metadata)
 	if err != nil {
 		return m, fmt.Errorf("scan message: %w", err)
 	}
+	m.SenderType = domain.SenderType(senderType)
 	m.MessageType = domain.MessageType(msgType)
 	m.Direction = domain.Direction(direction)
 	m.Processed = processed != 0

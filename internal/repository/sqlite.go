@@ -55,6 +55,10 @@ func Open(ctx context.Context, path string) (*DB, error) {
 		sqlDB.Close()
 		return nil, err
 	}
+	if err := db.MigrateCRM(ctx); err != nil {
+		sqlDB.Close()
+		return nil, err
+	}
 	return db, nil
 }
 

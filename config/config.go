@@ -27,6 +27,7 @@ type Config struct {
 	OpenAIAPIKey          string
 	OpenAIBaseURL         string
 	OpenAIModel           string
+	OpenAIClassifierModel string
 	OpenAIMaxOutputTokens int
 	OpenAIContextMessages int
 	OpenAITimeoutSeconds  int
@@ -77,6 +78,37 @@ type Config struct {
 	DryRun          bool   // process everything but never actually send a WhatsApp message
 	DefaultLeadSrc  string // source recorded on leads when nothing else is known
 	TraceRawPayload bool   // persist raw webhook bodies for full auditability
+
+	// ----------------------------------------------------------- Admin CRM
+	AdminEnabled       bool
+	AdminBasePath      string
+	AdminBootstrapMail string
+	AdminBootstrapPass string
+	AdminBootstrapName string
+	AdminSessionHours  int
+	AdminSecureCookies bool
+	AdminPBKDF2Iter    int
+	AdminMaxAttempts   int
+	AdminLockoutTries  int
+	AdminLockoutMins   int
+
+	// Media storage for CRM conversations.
+	MediaPath       string
+	MediaMaxSizeMB  int
+	MediaDownloadIn bool
+
+	// Follow-up automation.
+	FollowUpEnabled       bool
+	FollowUpDelays        []time.Duration
+	FollowUpMaxAttempts   int
+	FollowUpPollSeconds   int
+	FollowUpBatchSize     int
+	FollowUpClaimTTLMins  int
+	FollowUpRetryMins     int
+	FollowUpBusinessOnly  bool
+	FollowUpBusinessStart int
+	FollowUpBusinessEnd   int
+	FollowUpTimezone      string
 }
 
 // Load reads configuration from the environment. If a .env file is present in
@@ -98,6 +130,7 @@ func Load() (*Config, error) {
 		OpenAIAPIKey:          os.Getenv("OPENAI_API_KEY"),
 		OpenAIBaseURL:         getenv("OPENAI_BASE_URL", "https://api.openai.com/v1"),
 		OpenAIModel:           getenv("OPENAI_MODEL", "gpt-4o-mini"),
+		OpenAIClassifierModel: getenv("OPENAI_CLASSIFIER_MODEL", ""),
 		OpenAIMaxOutputTokens: getenvInt("OPENAI_MAX_OUTPUT_TOKENS", 300),
 		OpenAIContextMessages: getenvInt("OPENAI_CONTEXT_MESSAGES", 10),
 		OpenAITimeoutSeconds:  getenvInt("OPENAI_TIMEOUT_SECONDS", 20),
@@ -140,6 +173,34 @@ func Load() (*Config, error) {
 		DryRun:          getenvBool("DRY_RUN", false),
 		DefaultLeadSrc:  getenv("DEFAULT_LEAD_SOURCE", "whatsapp"),
 		TraceRawPayload: getenvBool("TRACE_RAW_PAYLOAD", true),
+
+		AdminEnabled:       getenvBool("ADMIN_ENABLED", true),
+		AdminBasePath:      getenv("ADMIN_BASE_PATH", "/admin"),
+		AdminBootstrapMail: strings.TrimSpace(os.Getenv("ADMIN_EMAIL")),
+		AdminBootstrapPass: os.Getenv("ADMIN_PASSWORD"),
+		AdminBootstrapName: getenv("ADMIN_NAME", "Administrator"),
+		AdminSessionHours:  getenvInt("ADMIN_SESSION_HOURS", 12),
+		AdminSecureCookies: getenvBool("ADMIN_SECURE_COOKIES", false),
+		AdminPBKDF2Iter:    getenvInt("ADMIN_PBKDF2_ITERATIONS", 600000),
+		AdminMaxAttempts:   getenvInt("ADMIN_LOGIN_MAX_ATTEMPTS", 10),
+		AdminLockoutTries:  getenvInt("ADMIN_LOCKOUT_THRESHOLD", 8),
+		AdminLockoutMins:   getenvInt("ADMIN_LOCKOUT_MINUTES", 15),
+
+		MediaPath:       getenv("MEDIA_PATH", "data/media"),
+		MediaMaxSizeMB:  getenvInt("MEDIA_MAX_SIZE_MB", 32),
+		MediaDownloadIn: getenvBool("MEDIA_DOWNLOAD_INBOUND", true),
+
+		FollowUpEnabled:       getenvBool("FOLLOWUP_ENABLED", true),
+		FollowUpDelays:        getenvDurations("FOLLOWUP_DELAYS", []time.Duration{time.Hour, 6 * time.Hour, 24 * time.Hour}),
+		FollowUpMaxAttempts:   getenvInt("FOLLOWUP_MAX_ATTEMPTS", 3),
+		FollowUpPollSeconds:   getenvInt("FOLLOWUP_POLL_SECONDS", 60),
+		FollowUpBatchSize:     getenvInt("FOLLOWUP_BATCH_SIZE", 20),
+		FollowUpClaimTTLMins:  getenvInt("FOLLOWUP_CLAIM_TTL_MINUTES", 5),
+		FollowUpRetryMins:     getenvInt("FOLLOWUP_RETRY_MINUTES", 10),
+		FollowUpBusinessOnly:  getenvBool("FOLLOWUP_BUSINESS_HOURS_ONLY", true),
+		FollowUpBusinessStart: getenvInt("FOLLOWUP_BUSINESS_START_HOUR", 9),
+		FollowUpBusinessEnd:   getenvInt("FOLLOWUP_BUSINESS_END_HOUR", 21),
+		FollowUpTimezone:      getenv("FOLLOWUP_TIMEZONE", "Asia/Almaty"),
 	}
 
 	if err := cfg.Validate(); err != nil {
@@ -214,6 +275,46 @@ func (c *Config) Validate() error {
 	}
 	if c.DianaWhatsAppPhone == "" && c.DianaWhatsAppUserID == "" {
 		problems = append(problems, "DIANA_WHATSAPP_PHONE or DIANA_WHATSAPP_USER_ID is required to hand off leads")
+	}
+	if c.AdminEnabled {
+		if !strings.HasPrefix(c.AdminBasePath, "/") {
+			problems = append(problems, "ADMIN_BASE_PATH must start with /")
+		}
+		if c.AdminSessionHours < 1 {
+			problems = append(problems, "ADMIN_SESSION_HOURS must be >= 1")
+		}
+		if c.AdminPBKDF2Iter < 100000 {
+			problems = append(problems, "ADMIN_PBKDF2_ITERATIONS must be >= 100000")
+		}
+		if c.MediaMaxSizeMB < 1 || c.MediaMaxSizeMB > 512 {
+			problems = append(problems, "MEDIA_MAX_SIZE_MB must be between 1 and 512")
+		}
+		// A bootstrap password is only used when no account exists yet, but a
+		// weak one must never be accepted even then.
+		if c.AdminBootstrapPass != "" && len([]rune(c.AdminBootstrapPass)) < 10 {
+			problems = append(problems, "ADMIN_PASSWORD must be at least 10 characters")
+		}
+		if c.AdminBootstrapMail != "" && !strings.Contains(c.AdminBootstrapMail, "@") {
+			problems = append(problems, "ADMIN_EMAIL must be a valid email address")
+		}
+	}
+	if c.FollowUpEnabled {
+		if len(c.FollowUpDelays) == 0 {
+			problems = append(problems, "FOLLOWUP_DELAYS must list at least one duration")
+		}
+		for _, d := range c.FollowUpDelays {
+			if d <= 0 {
+				problems = append(problems, "FOLLOWUP_DELAYS must contain positive durations")
+				break
+			}
+		}
+		if c.FollowUpBusinessOnly && (c.FollowUpBusinessStart < 0 || c.FollowUpBusinessEnd > 24 ||
+			c.FollowUpBusinessEnd <= c.FollowUpBusinessStart) {
+			problems = append(problems, "FOLLOWUP_BUSINESS_START_HOUR must be lower than FOLLOWUP_BUSINESS_END_HOUR (0-24)")
+		}
+		if _, err := time.LoadLocation(c.FollowUpTimezone); err != nil {
+			problems = append(problems, "FOLLOWUP_TIMEZONE is not a valid IANA timezone")
+		}
 	}
 
 	if len(problems) > 0 {
@@ -290,6 +391,51 @@ func getenvBool(key string, def bool) bool {
 		return def
 	}
 	return b
+}
+
+// getenvDurations parses a comma-separated duration list such as "1h,6h,24h".
+// Follow-up timing is configuration, never a constant in the business logic.
+func getenvDurations(key string, def []time.Duration) []time.Duration {
+	raw := strings.TrimSpace(os.Getenv(key))
+	if raw == "" {
+		return def
+	}
+	parts := strings.Split(raw, ",")
+	out := make([]time.Duration, 0, len(parts))
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p == "" {
+			continue
+		}
+		d, err := time.ParseDuration(p)
+		if err != nil || d <= 0 {
+			return def
+		}
+		out = append(out, d)
+	}
+	if len(out) == 0 {
+		return def
+	}
+	return out
+}
+
+// AdminSessionTTL is how long an admin session survives without activity.
+func (c *Config) AdminSessionTTL() time.Duration {
+	return time.Duration(c.AdminSessionHours) * time.Hour
+}
+
+// MediaMaxBytes is the accepted upload size in bytes.
+func (c *Config) MediaMaxBytes() int64 {
+	return int64(c.MediaMaxSizeMB) << 20
+}
+
+// FollowUpLocation resolves the configured business-hours timezone.
+func (c *Config) FollowUpLocation() *time.Location {
+	loc, err := time.LoadLocation(c.FollowUpTimezone)
+	if err != nil {
+		return time.UTC
+	}
+	return loc
 }
 
 func getenvInt64Slice(key string) []int64 {

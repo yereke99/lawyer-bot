@@ -1,13 +1,19 @@
 # lawyer-bot
 
-WhatsApp AI lead qualification bot for a legal services company.
+WhatsApp AI assistant and Admin CRM for a legal services company.
 
-This is **not** a general purpose chatbot. It is a lead qualification system:
-it reads incoming WhatsApp messages, works out whether they are about legal
-services, identifies which service the customer needs, asks the minimum number
-of questions, and hands a qualified lead to Diana.
+This is **not** a general purpose chatbot. It is a lead qualification system
+with a consultant panel: it reads incoming WhatsApp messages, works out whether
+they are about legal services, identifies which service the customer needs, asks
+the minimum number of questions, keeps durable state per client, follows up
+automatically, and lets a human consultant take the conversation over at any
+moment from the CRM.
 
-Three rules are enforced by the architecture, not just by the prompt:
+The Admin CRM lives at `/admin` in the same binary. See **[docs/CRM.md](docs/CRM.md)**
+for its architecture, the state machine, the follow-up guarantees and the
+security model.
+
+Five rules are enforced by the architecture, not just by the prompt:
 
 1. **The bot never starts a conversation.** Every code path that sends a message
    is reachable only from an inbound Green API polling notification or Meta
@@ -18,15 +24,26 @@ Three rules are enforced by the architecture, not just by the prompt:
    classification; deterministic Go code in `response_decision.go` decides
    whether a response is allowed. When `LLM_AGENT_REPLIES=true`, OpenAI then
    writes the customer-facing wording for that allowed response.
+4. **The assistant and a consultant never both answer.** `crmGate` suppresses
+   automation for a blocked, paused, closed or human-owned conversation before a
+   single token is spent, and every outgoing message — automatic or manual —
+   leaves through one `Messenger` holding a per-chat lock.
+5. **The model never sets business state.** It may suggest a stage or a status;
+   `statemachine.go` validates the value and the transition against what the
+   database holds. Terminal statuses are human decisions only.
 
 ## Pipeline
 
 ```
-green polling/webhook -> store -> gate -> classify -> decide -> agent/template -> reply delay -> reply -> qualify -> notify
-                         |        |         |          |          |              |          |         |
-                      always   free     OpenAI     Go rules   OpenAI or       timer   WhatsApp   to Diana
-                                                             safe fallback
+green polling/webhook -> store -> crm gate -> gate -> classify -> state machine -> decide -> agent/template -> reply -> qualify -> follow-up
+                         |          |          |        |            |              |          |               |         |          |
+                      always    blocked?     free    OpenAI      validated       Go rules   OpenAI or      WhatsApp  to Diana   durable job
+                                human?                                                      safe fallback
 ```
+
+Inbound transport is unchanged: Green API **native polling**, no incoming
+webhook. The CRM's own live updates use SSE between the browser and this server,
+which is a separate concern from how WhatsApp messages arrive.
 
 The **gate** (`internal/service/gate.go`) is the token budget guard. It runs
 before any OpenAI call:
@@ -205,6 +222,15 @@ token gate, the response decision engine, lead qualification, reply generation
 and price protection, phone normalisation, repositories, webhook parsing,
 signature verification and the end-to-end pipeline including the Diana handoff.
 
+The CRM adds coverage for: migration idempotency on a database that already
+holds production rows, client lookup and de-duplication, human takeover under
+concurrency, AI suppression during takeover, resume, blocking, closing, durable
+follow-up scheduling and exclusive claiming, cancellation on reply, stale-claim
+recovery, business hours, concurrent messages from one client, the OpenAI
+outage path, the WhatsApp failure path, media validation and path traversal,
+authentication, CSRF, rate limiting, authorization by role, export contents, and
+the state machine's refusal of illegal model suggestions.
+
 ## Reliability
 
 - OpenAI down: the error is logged and stored, deterministic triggers become the
@@ -218,3 +244,9 @@ signature verification and the end-to-end pipeline including the Diana handoff.
   message ID, so a customer is never answered twice.
 - Per-chat processing is sequenced, so a delayed reply in one chat does not
   reorder that customer's bot messages or block unrelated chats.
+- Follow-ups are database rows, not timers: a restart never loses one, a job is
+  claimed by exactly one worker, and a claim abandoned by a crashed worker is
+  recovered after `FOLLOWUP_CLAIM_TTL_MINUTES`.
+- A follow-up is re-validated against the live client immediately before sending,
+  so a nudge is never delivered to someone who has already replied, been blocked,
+  been taken over or been closed.

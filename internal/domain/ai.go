@@ -65,7 +65,12 @@ type AIContextMessage struct {
 }
 
 // AIInput is everything the classifier is allowed to see. It deliberately
-// carries no database identifiers, logs or admin data.
+// carries no database identifiers, logs or admin data, and no information about
+// any other client.
+//
+// Token strategy: History is a small bounded window of recent turns. Everything
+// older is represented by Summary and ImportantFacts, which is what keeps the
+// per-message prompt from growing with the lifetime of the conversation.
 type AIInput struct {
 	Text            string
 	History         []AIContextMessage
@@ -74,10 +79,17 @@ type AIInput struct {
 	KnownLanguage   Language
 	KnownFacts      map[string]string
 	Services        []LegalService
+
+	// Compact durable client state.
+	Summary            string
+	ImportantFacts     []string
+	QualificationStage string
+	CRMStatus          string
 }
 
 // AIClassification is the structured result returned by the model. It is
-// advisory only: the application decides whether to reply.
+// advisory only: the application decides whether to reply, and every field
+// below is re-validated server-side before it is allowed to change any state.
 type AIClassification struct {
 	IsRelevant            bool              `json:"is_relevant"`
 	ShouldRespond         bool              `json:"should_respond"`
@@ -90,6 +102,15 @@ type AIClassification struct {
 	LeadScore             float64           `json:"lead_score"`
 	Summary               string            `json:"summary"`
 	Facts                 map[string]string `json:"facts"`
+
+	// CRM analysis. These are suggestions: the state machine validates each one
+	// against the state the database currently holds before anything is stored.
+	QualificationStage string   `json:"qualification_stage"`
+	LeadStatus         string   `json:"lead_status"`
+	NeedsHuman         bool     `json:"needs_human"`
+	SummaryUpdate      string   `json:"summary_update"`
+	ImportantFacts     []string `json:"important_facts"`
+	SuggestedFollowUp  string   `json:"suggested_follow_up"`
 
 	// Populated by the client, not the model.
 	Model            string `json:"-"`
@@ -115,6 +136,8 @@ type AIReplyInput struct {
 	KnownLanguage     Language
 	KnownFacts        map[string]string
 	Services          []LegalService
+	Summary           string
+	ImportantFacts    []string
 	Classification    AIClassification
 	ReplyAction       string
 	DecisionReason    string

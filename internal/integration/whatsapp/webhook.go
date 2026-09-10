@@ -136,6 +136,7 @@ type greenWebhookPayload struct {
 			Caption     string `json:"caption"`
 			FileName    string `json:"fileName"`
 			MimeType    string `json:"mimeType"`
+			IsAnimated  bool   `json:"isAnimated"`
 		} `json:"fileMessageData"`
 		LocationMessageData struct {
 			NameLocation string `json:"nameLocation"`
@@ -306,8 +307,14 @@ func convertGreenMessage(m greenWebhookPayload) domain.InboundMessage {
 		in.MessageType = domain.MessageVideo
 		applyGreenFile(&in, m)
 	case "audioMessage":
+		// Green API reports a voice note as an audio message with an ogg/opus
+		// mime type; the CRM renders those as a voice bubble.
 		in.MessageType = domain.MessageAudio
 		applyGreenFile(&in, m)
+		if strings.Contains(strings.ToLower(in.MimeType), "ogg") {
+			in.MessageType = domain.MessageVoice
+			in.Voice = true
+		}
 	case "documentMessage":
 		in.MessageType = domain.MessageDocument
 		applyGreenFile(&in, m)
@@ -343,6 +350,7 @@ func applyMedia(in *domain.InboundMessage, m *mediaObject) {
 
 func applyGreenFile(in *domain.InboundMessage, m greenWebhookPayload) {
 	in.MediaID = m.IDMessage
+	in.MediaURL = m.MessageData.FileMessageData.DownloadURL
 	in.MimeType = m.MessageData.FileMessageData.MimeType
 	in.Caption = m.MessageData.FileMessageData.Caption
 	in.Filename = m.MessageData.FileMessageData.FileName

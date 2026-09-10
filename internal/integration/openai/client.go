@@ -17,23 +17,30 @@ import (
 // two steps: first for structured classification, then for a customer-facing
 // agent reply only after deterministic application rules allow a response.
 type Client struct {
-	apiKey     string
-	baseURL    string
-	model      string
-	maxTokens  int
-	maxInput   int
-	httpClient *http.Client
+	apiKey          string
+	baseURL         string
+	model           string
+	classifierModel string
+	maxTokens       int
+	maxInput        int
+	httpClient      *http.Client
 }
 
 // Options configures the client.
 type Options struct {
-	APIKey        string
-	BaseURL       string
-	Model         string
-	MaxTokens     int
-	MaxInputChars int
-	Timeout       time.Duration
-	HTTPClient    *http.Client
+	APIKey  string
+	BaseURL string
+	// Model writes the customer-facing answer.
+	Model string
+	// ClassifierModel does the cheap structured analysis. Leaving it empty
+	// reuses Model; setting it to a smaller model is the single biggest cost
+	// lever in the system, because classification runs on every message while
+	// reply generation runs only when the application has decided to answer.
+	ClassifierModel string
+	MaxTokens       int
+	MaxInputChars   int
+	Timeout         time.Duration
+	HTTPClient      *http.Client
 }
 
 // New builds a Client.
@@ -54,15 +61,25 @@ func New(opts Options) *Client {
 	if httpClient == nil {
 		httpClient = &http.Client{Timeout: opts.Timeout}
 	}
+	if strings.TrimSpace(opts.ClassifierModel) == "" {
+		opts.ClassifierModel = opts.Model
+	}
 	return &Client{
-		apiKey:     opts.APIKey,
-		baseURL:    strings.TrimRight(opts.BaseURL, "/"),
-		model:      opts.Model,
-		maxTokens:  opts.MaxTokens,
-		maxInput:   opts.MaxInputChars,
-		httpClient: httpClient,
+		apiKey:          opts.APIKey,
+		baseURL:         strings.TrimRight(opts.BaseURL, "/"),
+		model:           opts.Model,
+		classifierModel: opts.ClassifierModel,
+		maxTokens:       opts.MaxTokens,
+		maxInput:        opts.MaxInputChars,
+		httpClient:      httpClient,
 	}
 }
+
+// Model reports the reply model in use.
+func (c *Client) Model() string { return c.model }
+
+// ClassifierModel reports the analysis model in use.
+func (c *Client) ClassifierModel() string { return c.classifierModel }
 
 // ClassifyMessage implements domain.AIClient.
 func (c *Client) ClassifyMessage(ctx context.Context, in domain.AIInput) (domain.AIClassification, error) {
@@ -72,13 +89,13 @@ func (c *Client) ClassifyMessage(ctx context.Context, in domain.AIInput) (domain
 	raw, usage, err := c.call(ctx, reqBody)
 	if err != nil {
 		return domain.AIClassification{
-			Model:            c.model,
+			Model:            c.classifierModel,
 			ProcessingTimeMS: time.Since(started).Milliseconds(),
 		}, err
 	}
 
 	result, err := parseClassification(raw, in)
-	result.Model = c.model
+	result.Model = c.classifierModel
 	result.InputTokens = usage.PromptTokens
 	result.OutputTokens = usage.CompletionTokens
 	result.RawResponse = raw
@@ -124,14 +141,18 @@ func (c *Client) buildRequest(in domain.AIInput) chatRequest {
 		messages = append(messages, chatMessage{Role: role, Content: truncate(h.Text, c.maxInput/2)})
 	}
 
+	// The customer's own text is fenced and explicitly marked untrusted, so a
+	// message that tries to rewrite the instructions is classified, not obeyed.
 	messages = append(messages, chatMessage{
-		Role:    "user",
-		Content: truncate(in.Text, c.maxInput),
+		Role: "user",
+		Content: "<<<CUSTOMER_MESSAGE\n" +
+			strings.ReplaceAll(truncate(in.Text, c.maxInput), "CUSTOMER_MESSAGE", "customer_message") +
+			"\nCUSTOMER_MESSAGE>>>",
 	})
 
 	temp := 0.0
 	return chatRequest{
-		Model:               c.model,
+		Model:               c.classifierModel,
 		Messages:            messages,
 		MaxCompletionTokens: c.maxTokens,
 		Temperature:         &temp,

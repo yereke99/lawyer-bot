@@ -42,6 +42,14 @@ func (r *recordingAI) ClassifyMessage(context.Context, domain.AIInput) (domain.A
 	}, nil
 }
 
+// count reports the number of classifications. The pipeline runs on a worker
+// goroutine, so the counter must be read under the same lock that writes it.
+func (r *recordingAI) count() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.calls
+}
+
 // recordingWA records outbound sends without contacting WhatsApp.
 type recordingWA struct {
 	mu   sync.Mutex
@@ -206,7 +214,7 @@ func TestWebhookRejectsInvalidSignature(t *testing.T) {
 	if rec.Code != http.StatusForbidden {
 		t.Fatalf("status = %d, want 403", rec.Code)
 	}
-	if ts.ai.calls != 0 {
+	if ts.ai.count() != 0 {
 		t.Fatal("an unsigned payload must never reach the pipeline")
 	}
 }
@@ -218,8 +226,8 @@ func TestWebhookAcknowledgesAndProcesses(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200", rec.Code)
 	}
-	if ts.ai.calls != 1 {
-		t.Fatalf("want 1 classification, got %d", ts.ai.calls)
+	if got := ts.ai.count(); got != 1 {
+		t.Fatalf("want 1 classification, got %d", got)
 	}
 	if ts.wa.count() != 1 {
 		t.Fatalf("want 1 reply, got %d", ts.wa.count())
@@ -237,7 +245,7 @@ func TestStatusCallbackProducesNoOutboundMessage(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200", rec.Code)
 	}
-	if ts.ai.calls != 0 {
+	if ts.ai.count() != 0 {
 		t.Fatal("a delivery receipt must not be classified")
 	}
 	if ts.wa.count() != 0 {

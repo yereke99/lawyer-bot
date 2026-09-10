@@ -38,10 +38,14 @@ func (t MessageType) Analyzable() bool {
 }
 
 // Message is one stored WhatsApp message in either direction.
+//
+// This is the single conversation model: the AI pipeline, the follow-up worker
+// and the Admin CRM all read and write these rows. There is no second message
+// table for the CRM.
 type Message struct {
 	ID                int64
-	UserID            int64
 	WhatsAppMessageID string
+	UserID            int64
 	TraceID           string
 	MessageType       MessageType
 	Text              string
@@ -54,6 +58,29 @@ type Message struct {
 	AIConfidence      float64
 	BotResponded      bool
 	CreatedAt         time.Time
+
+	// CRM fields. SenderType separates the client, the assistant, a consultant
+	// and system events in the CRM conversation view.
+	SenderType     SenderType
+	SenderAdminID  int64
+	MediaPath      string
+	MediaMime      string
+	MediaName      string
+	MediaSize      int64
+	DeliveryStatus string
+	ReplyTo        string
+	Metadata       string
+}
+
+// SenderOrDefault infers the sender when a legacy row has none stored.
+func (m Message) SenderOrDefault() SenderType {
+	if m.SenderType.Valid() {
+		return m.SenderType
+	}
+	if m.Direction == DirectionIncoming {
+		return SenderClient
+	}
+	return SenderAI
 }
 
 // Content returns the text the classifier should look at: the body for text

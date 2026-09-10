@@ -15,10 +15,12 @@ import (
 	"lawyer-bot/config"
 	"lawyer-bot/internal/domain"
 	"lawyer-bot/internal/handler"
+	"lawyer-bot/internal/handler/admin"
 	"lawyer-bot/internal/integration/openai"
 	"lawyer-bot/internal/integration/whatsapp"
 	"lawyer-bot/internal/repository"
 	"lawyer-bot/internal/service"
+	"lawyer-bot/internal/web"
 	"lawyer-bot/internal/worker"
 	"lawyer-bot/traits/logger"
 )
@@ -71,14 +73,26 @@ func run() error {
 	aiLog := repository.NewAIInteractionRepository(db)
 	trace := repository.NewTraceRepository(db)
 
+	// CRM stores. They read and write the same tables as the pipeline; nothing
+	// about the conversation model is duplicated for the CRM.
+	crmClients := repository.NewCRMRepository(db)
+	adminUsers := repository.NewAdminRepository(db)
+	followUpJobs := repository.NewFollowUpRepository(db)
+	notes := repository.NewNoteRepository(db)
+	auditLog := repository.NewAuditRepository(db)
+	settings := repository.NewSettingsRepository(db)
+
 	// -------------------------------------------------------- integrations
 	aiClient := openai.New(openai.Options{
-		APIKey:        cfg.OpenAIAPIKey,
-		BaseURL:       cfg.OpenAIBaseURL,
-		Model:         cfg.OpenAIModel,
-		MaxTokens:     cfg.OpenAIMaxOutputTokens,
-		MaxInputChars: cfg.OpenAIMaxInputChars,
-		Timeout:       cfg.OpenAITimeout(),
+		APIKey:  cfg.OpenAIAPIKey,
+		BaseURL: cfg.OpenAIBaseURL,
+		Model:   cfg.OpenAIModel,
+		// Structured analysis runs on every message and can use a cheaper
+		// model than the one that writes the customer-facing answer.
+		ClassifierModel: cfg.OpenAIClassifierModel,
+		MaxTokens:       cfg.OpenAIMaxOutputTokens,
+		MaxInputChars:   cfg.OpenAIMaxInputChars,
+		Timeout:         cfg.OpenAITimeout(),
 	})
 
 	var (
@@ -104,6 +118,19 @@ func run() error {
 		})
 	}
 
+	// --------------------------------------------------------------- media
+	var mediaFetcher domain.WhatsAppFileFetcher
+	if greenClient != nil && cfg.MediaDownloadIn {
+		mediaFetcher = greenClient
+	}
+	mediaStore, err := service.NewMediaStore(service.MediaConfig{
+		Root:     cfg.MediaPath,
+		MaxBytes: cfg.MediaMaxBytes(),
+	}, mediaFetcher)
+	if err != nil {
+		return fmt.Errorf("init media store: %w", err)
+	}
+
 	// ------------------------------------------------------------ services
 	catalog := service.NewCatalog()
 	triggers := service.NewTriggerSet()
@@ -111,6 +138,40 @@ func run() error {
 		MaxCallsPerDay:    cfg.AIMaxCallsPerDay,
 		AnalyzeUnmatched:  cfg.AIAnalyzeUnmatched,
 		MinWordsUnmatched: cfg.AIMinWordsUnmatched,
+	})
+
+	// The CRM live stream and the single outbound layer are built before the
+	// pipeline, because the pipeline sends through the latter.
+	hub := service.NewEventHub()
+
+	messenger := service.NewMessenger(service.MessengerDeps{
+		Messages: messages,
+		CRM:      crmClients,
+		Trace:    trace,
+		WhatsApp: waClient,
+		Logger:   log,
+	}, service.MessengerConfig{DryRun: cfg.DryRun})
+	messenger.OnSent(hub.ClientChanged)
+
+	followUps := service.NewFollowUpService(service.FollowUpDeps{
+		Jobs:     followUpJobs,
+		CRM:      crmClients,
+		Messages: messages,
+		Trace:    trace,
+		Sender:   messenger,
+		Logger:   log,
+	}, service.FollowUpConfig{
+		Enabled:           cfg.FollowUpEnabled,
+		Delays:            cfg.FollowUpDelays,
+		MaxAttempts:       cfg.FollowUpMaxAttempts,
+		PollInterval:      time.Duration(cfg.FollowUpPollSeconds) * time.Second,
+		BatchSize:         cfg.FollowUpBatchSize,
+		ClaimTTL:          time.Duration(cfg.FollowUpClaimTTLMins) * time.Minute,
+		RetryBackoff:      time.Duration(cfg.FollowUpRetryMins) * time.Minute,
+		BusinessHoursOnly: cfg.FollowUpBusinessOnly,
+		BusinessStartHour: cfg.FollowUpBusinessStart,
+		BusinessEndHour:   cfg.FollowUpBusinessEnd,
+		Location:          cfg.FollowUpLocation(),
 	})
 
 	pipeline := service.NewPipeline(service.PipelineDeps{
@@ -127,6 +188,11 @@ func run() error {
 		Qualify:  service.NewQualifier(catalog, cfg.AIMinConfidence),
 		Triggers: triggers,
 		Logger:   log,
+		Clients:  crmClients,
+		FollowUp: followUps,
+		Media:    mediaStore,
+		Sender:   messenger,
+		Notify:   hub.ClientChanged,
 	}, service.PipelineConfig{
 		MinConfidence:   cfg.AIMinConfidence,
 		ContextMessages: cfg.OpenAIContextMessages,
@@ -173,10 +239,98 @@ func run() error {
 		log.Info("whatsapp webhook disabled; green api native polling is the inbound transport")
 	}
 
-	router := handler.NewRouter(webhook, pool, log, handler.RouterConfig{
+	// ----------------------------------------------------------- admin crm
+	routerCfg := handler.RouterConfig{
 		WebhookPath: cfg.WebhookPath,
 		Version:     version,
-	})
+	}
+	if cfg.AdminEnabled {
+		authService := service.NewAuthService(adminUsers, auditLog, log, service.AuthConfig{
+			SessionTTL:       cfg.AdminSessionTTL(),
+			PBKDF2Iterations: cfg.AdminPBKDF2Iter,
+			MaxAttempts:      cfg.AdminMaxAttempts,
+			LockoutThreshold: cfg.AdminLockoutTries,
+			LockoutDuration:  time.Duration(cfg.AdminLockoutMins) * time.Minute,
+			SecureCookies:    cfg.AdminSecureCookies,
+		})
+
+		created, err := authService.EnsureBootstrapAdmin(ctx,
+			cfg.AdminBootstrapMail, cfg.AdminBootstrapPass, cfg.AdminBootstrapName)
+		if err != nil {
+			return fmt.Errorf("bootstrap admin account: %w", err)
+		}
+		if created {
+			log.Info("first admin account created from ADMIN_EMAIL/ADMIN_PASSWORD")
+		}
+		authService.StartJanitor(ctx, time.Hour)
+
+		crmService := service.NewCRMService(service.CRMDeps{
+			Clients:  crmClients,
+			Messages: messages,
+			Notes:    notes,
+			Audit:    auditLog,
+			Jobs:     followUpJobs,
+			Admins:   adminUsers,
+			FollowUp: followUps,
+			Sender:   messenger,
+			Media:    mediaStore,
+			Catalog:  catalog,
+			Logger:   log,
+		})
+
+		adminAPI := admin.New(admin.Deps{
+			Auth:     authService,
+			CRM:      crmService,
+			Clients:  crmClients,
+			Messages: messages,
+			Notes:    notes,
+			Jobs:     followUpJobs,
+			Admins:   adminUsers,
+			Audit:    auditLog,
+			AILog:    aiLog,
+			Settings: settings,
+			Export:   service.NewExportService(crmClients, catalog),
+			Media:    mediaStore,
+			Catalog:  catalog,
+			Hub:      hub,
+			FollowUp: followUps,
+			Logger:   log,
+		}, admin.Config{
+			BasePath:      cfg.AdminBasePath,
+			SecureCookies: cfg.AdminSecureCookies,
+			SessionTTL:    cfg.AdminSessionTTL(),
+			MaxUploadSize: cfg.MediaMaxBytes(),
+			FollowUp:      followUps.Config(),
+			Version:       version,
+			Models: admin.ModelInfo{
+				ReplyModel:      aiClient.Model(),
+				ClassifierModel: aiClient.ClassifierModel(),
+				MaxOutputTokens: cfg.OpenAIMaxOutputTokens,
+				ContextMessages: cfg.OpenAIContextMessages,
+				AgentReplies:    cfg.LLMAgentReplies,
+				MinConfidence:   cfg.AIMinConfidence,
+				DryRun:          cfg.DryRun,
+			},
+		})
+
+		routerCfg.AdminBasePath = cfg.AdminBasePath
+		routerCfg.AdminAPI = adminAPI.Routes()
+		routerCfg.AdminUI = web.Handler(cfg.AdminBasePath)
+
+		if !cfg.AdminSecureCookies {
+			log.Warn("ADMIN_SECURE_COOKIES is false: enable it whenever the CRM is served over HTTPS")
+		}
+		log.Info("admin crm mounted",
+			zap.String("path", cfg.AdminBasePath),
+			zap.Bool("media_send", messenger.SupportsFiles()),
+			zap.Bool("follow_ups", cfg.FollowUpEnabled))
+	}
+
+	// The follow-up worker is durable: its jobs live in the database, so a
+	// restart never loses a scheduled nudge.
+	followUps.Start(context.WithoutCancel(ctx))
+
+	router := handler.NewRouter(webhook, pool, log, routerCfg)
 
 	srv := &http.Server{
 		Addr:              cfg.HTTPAddr,

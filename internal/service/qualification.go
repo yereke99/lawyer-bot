@@ -42,6 +42,14 @@ type Pipeline struct {
 	triggers *TriggerSet
 	log      *zap.Logger
 
+	// CRM collaborators. They are optional so the pipeline stays testable in
+	// isolation, but in production every one of them is wired.
+	clients  *repository.CRMRepository
+	follow   *FollowUpService
+	media    *MediaStore
+	sender   *Messenger
+	onChange func(userID int64)
+
 	order *chatSequencer
 	cfg   PipelineConfig
 }
@@ -75,6 +83,12 @@ type PipelineDeps struct {
 	Qualify  *Qualifier
 	Triggers *TriggerSet
 	Logger   *zap.Logger
+
+	Clients  *repository.CRMRepository
+	FollowUp *FollowUpService
+	Media    *MediaStore
+	Sender   *Messenger
+	Notify   func(userID int64)
 }
 
 // NewPipeline builds a Pipeline.
@@ -107,6 +121,11 @@ func NewPipeline(deps PipelineDeps, cfg PipelineConfig) *Pipeline {
 		qualify:  deps.Qualify,
 		triggers: deps.Triggers,
 		log:      deps.Logger,
+		clients:  deps.Clients,
+		follow:   deps.FollowUp,
+		media:    deps.Media,
+		sender:   deps.Sender,
+		onChange: deps.Notify,
 		order:    newChatSequencer(),
 		cfg:      cfg,
 	}
@@ -224,14 +243,46 @@ func (p *Pipeline) Handle(ctx context.Context, in domain.InboundMessage) error {
 		zap.String("type", string(in.MessageType)),
 		logger.Preview("text", in.Content()))
 
-	// Media metadata is always recorded; the binary is never fetched implicitly.
-	if in.MediaID != "" {
+	// Media metadata is always recorded, and the binary is stored locally when
+	// the provider supports downloading it: a provider link is not permanent, so
+	// the CRM keeps its own copy of what the client sent.
+	if in.MediaID != "" || in.MediaURL != "" {
 		if _, err := p.trace.MediaAsset(ctx, domain.MediaAsset{
 			UserID: user.ID, MessageID: messageID, MediaID: in.MediaID,
 			MimeType: in.MimeType, SHA256: in.SHA256, Filename: in.Filename,
 			Caption: in.Caption, Voice: in.Voice,
 		}); err != nil {
 			log.Warn("store media metadata failed", zap.Error(err))
+		}
+		p.storeInboundMedia(ctx, log, in, user.ID, messageID)
+	}
+
+	// -------------------------------------------- 3. CRM: client replied
+	// Activity, unread badge and cancellation of every now-obsolete follow-up.
+	p.onInbound(ctx, log, user.ID, in.Timestamp)
+
+	// The CRM gate runs before any token is spent. A blocked client, a closed
+	// lead, a paused conversation or one a consultant has taken over is stored
+	// and traced, and the assistant stays silent — which is the interlock that
+	// stops two answers reaching the same client.
+	client, clientErr := p.crmClient(ctx, log, user.ID)
+	if clientErr == nil {
+		if reason, allowed := crmGate(client); !allowed {
+			p.event(ctx, domain.TraceEvent{TraceID: in.TraceID, UserID: user.ID, MessageID: messageID,
+				Stage: StageCRMGate, Decision: domain.DecisionSilent, Reason: reason,
+				Detail: repository.Detail(map[string]any{
+					"mode":       string(client.Mode),
+					"crm_status": string(client.CRMStatus),
+					"blocked":    client.Blocked,
+				})})
+			if err := p.messages.MarkProcessed(ctx, messageID, false, "", 0, false); err != nil {
+				log.Warn("mark message processed failed", zap.Error(err))
+			}
+			p.event(ctx, domain.TraceEvent{TraceID: in.TraceID, UserID: user.ID, MessageID: messageID,
+				Stage: domain.StagePipelineDone, Decision: domain.DecisionSilent,
+				Reason: reason, DurationMS: time.Since(started).Milliseconds()})
+			log.Info("automation suppressed for client", zap.String("reason", reason))
+			return nil
 		}
 	}
 
@@ -285,7 +336,7 @@ func (p *Pipeline) Handle(ctx context.Context, in domain.InboundMessage) error {
 		aiFailed       bool
 	)
 	if gateResult.CallAI {
-		classification, aiFailed = p.classify(ctx, log, user, messageID, in)
+		classification, aiFailed = p.classify(ctx, log, user, client, messageID, in)
 	}
 
 	// ------------------------------------------------------- 7. decide
@@ -331,6 +382,10 @@ func (p *Pipeline) Handle(ctx context.Context, in domain.InboundMessage) error {
 	// Language and service are learned even when the bot stays silent.
 	p.rememberContext(ctx, log, user, classification, decision, messageID, in.TraceID)
 
+	// The CRM record is updated whatever the reply decision was: a consultant
+	// must see the analysis of a message even when the assistant said nothing.
+	p.applyCRMState(ctx, log, client, classification, decision, gateResult.CallAI, in.TraceID, messageID)
+
 	if !decision.Respond {
 		p.event(ctx, domain.TraceEvent{TraceID: in.TraceID, UserID: user.ID, MessageID: messageID,
 			Stage: domain.StagePipelineDone, Decision: domain.DecisionSilent,
@@ -342,7 +397,7 @@ func (p *Pipeline) Handle(ctx context.Context, in domain.InboundMessage) error {
 	lang := replyLanguage(classification.Language, user.Language)
 	text := p.composer.Compose(decision, lang, classification.ClarificationQuestion)
 	if p.shouldGenerateAgentReply(gateResult, aiFailed) {
-		if agentText, ok := p.generateAgentReply(ctx, log, user, messageID, in, classification, decision, lang, facts); ok {
+		if agentText, ok := p.generateAgentReply(ctx, log, user, client, messageID, in, classification, decision, lang, facts); ok {
 			text = agentText
 		}
 	}
@@ -374,6 +429,12 @@ func (p *Pipeline) Handle(ctx context.Context, in domain.InboundMessage) error {
 	// ------------------------------------------------------- 10. qualify lead
 	p.qualifyLead(ctx, log, user, classification, decision, gateResult, in, lang, facts)
 
+	// The assistant answered and is now waiting: plan the first nudge, anchored
+	// to this client message so a reply invalidates the whole chain.
+	if refreshed, err := p.crmClient(ctx, log, user.ID); err == nil {
+		p.planFollowUp(ctx, log, refreshed, messageID, in.TraceID)
+	}
+
 	p.event(ctx, domain.TraceEvent{TraceID: in.TraceID, UserID: user.ID, MessageID: messageID,
 		Stage: domain.StagePipelineDone, Decision: domain.DecisionRespond,
 		Reason: decision.Reason, DurationMS: time.Since(started).Milliseconds()})
@@ -381,9 +442,12 @@ func (p *Pipeline) Handle(ctx context.Context, in domain.InboundMessage) error {
 }
 
 // classify calls the model and records the interaction whatever the outcome.
-func (p *Pipeline) classify(ctx context.Context, log *zap.Logger, user *domain.User, messageID int64, in domain.InboundMessage) (domain.AIClassification, bool) {
+func (p *Pipeline) classify(ctx context.Context, log *zap.Logger, user *domain.User,
+	client *domain.CRMClient, messageID int64, in domain.InboundMessage) (domain.AIClassification, bool) {
+
 	history := p.history(ctx, log, user.ID, messageID)
 	facts, _ := p.trace.Facts(ctx, user.ID)
+	summary, importantFacts, stage, status := crmContext(client)
 
 	p.event(ctx, domain.TraceEvent{TraceID: in.TraceID, UserID: user.ID, MessageID: messageID,
 		Stage: domain.StageAIRequested, Decision: domain.DecisionCallAI,
@@ -397,6 +461,13 @@ func (p *Pipeline) classify(ctx context.Context, log *zap.Logger, user *domain.U
 		KnownLanguage:   user.Language,
 		KnownFacts:      facts,
 		Services:        p.catalog.All(),
+
+		// The compact durable state replaces the older half of the
+		// conversation, which is what keeps the prompt a constant size.
+		Summary:            summary,
+		ImportantFacts:     importantFacts,
+		QualificationStage: stage,
+		CRMStatus:          status,
 	})
 
 	record := &domain.AIInteraction{
@@ -451,7 +522,7 @@ func (p *Pipeline) shouldGenerateAgentReply(gate GateResult, aiFailed bool) bool
 }
 
 func (p *Pipeline) generateAgentReply(ctx context.Context, log *zap.Logger, user *domain.User,
-	messageID int64, in domain.InboundMessage, cls domain.AIClassification,
+	client *domain.CRMClient, messageID int64, in domain.InboundMessage, cls domain.AIClassification,
 	decision Decision, lang domain.Language, facts map[string]string) (string, bool) {
 
 	history := p.history(ctx, log, user.ID, messageID)
@@ -486,6 +557,8 @@ func (p *Pipeline) generateAgentReply(ctx context.Context, log *zap.Logger, user
 		KnownLanguage:     lang,
 		KnownFacts:        facts,
 		Services:          p.catalog.All(),
+		Summary:           summaryOf(client),
+		ImportantFacts:    importantFactsOf(client),
 		Classification:    cls,
 		ReplyAction:       string(decision.Action),
 		DecisionReason:    decision.Reason,
@@ -587,6 +660,7 @@ func (p *Pipeline) send(ctx context.Context, log *zap.Logger, user *domain.User,
 		Text:        text,
 		Direction:   domain.DirectionOutgoing,
 		Processed:   true,
+		SenderType:  domain.SenderAI,
 	}
 	outgoingID, err := p.messages.Create(ctx, outgoing)
 	if err != nil {
@@ -616,7 +690,7 @@ func (p *Pipeline) send(ctx context.Context, log *zap.Logger, user *domain.User,
 		return err
 	}
 
-	res, sendErr := p.wa.SendText(ctx, user.WhatsAppUserID, text)
+	res, sendErr := p.deliver(ctx, user.WhatsAppUserID, text)
 	delivery := domain.Delivery{
 		UserID: user.ID, MessageID: outgoingID, TraceID: traceID,
 		Recipient: user.WhatsAppUserID, Kind: domain.DeliveryKindReply, Attempts: 1,
@@ -835,7 +909,7 @@ func (p *Pipeline) notify(ctx context.Context, log *zap.Logger, user *domain.Use
 		return
 	}
 
-	res, err := p.wa.SendText(ctx, recipient, body)
+	res, err := p.deliver(ctx, recipient, body)
 	if err != nil {
 		notification.Status = domain.DeliveryFailed
 		notification.Error = err.Error()
@@ -914,4 +988,43 @@ func errDetail(err error) string {
 		msg = err.Error()
 	}
 	return repository.Detail(map[string]any{"error": msg})
+}
+
+// deliver is the pipeline's single exit to WhatsApp. It prefers the shared
+// Messenger when one is wired, so automatic replies and consultant replies use
+// exactly the same provider integration and the same per-chat send lock.
+func (p *Pipeline) deliver(ctx context.Context, recipient, text string) (domain.SendResult, error) {
+	if p.sender != nil {
+		return p.sender.SendRaw(ctx, recipient, text)
+	}
+	return p.wa.SendText(ctx, recipient, text)
+}
+
+// crmClient loads the CRM view of a contact. A missing CRM repository (unit
+// tests) or a lookup failure is not fatal: the pipeline degrades to its
+// pre-CRM behaviour rather than dropping the message.
+func (p *Pipeline) crmClient(ctx context.Context, log *zap.Logger, userID int64) (*domain.CRMClient, error) {
+	if p.clients == nil {
+		return nil, errors.New("crm repository not configured")
+	}
+	client, err := p.clients.GetClient(ctx, userID)
+	if err != nil {
+		log.Warn("load crm client failed", zap.Error(err))
+		return nil, err
+	}
+	return client, nil
+}
+
+func summaryOf(client *domain.CRMClient) string {
+	if client == nil {
+		return ""
+	}
+	return client.AISummary
+}
+
+func importantFactsOf(client *domain.CRMClient) []string {
+	if client == nil {
+		return nil
+	}
+	return client.ImportantFacts
 }

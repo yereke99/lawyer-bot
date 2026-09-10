@@ -3,6 +3,7 @@ package handler
 import (
 	"encoding/json"
 	"net/http"
+	"strings"
 	"time"
 
 	"go.uber.org/zap"
@@ -14,6 +15,12 @@ import (
 type RouterConfig struct {
 	WebhookPath string
 	Version     string
+
+	// AdminBasePath mounts the Admin CRM. Empty disables it entirely.
+	AdminBasePath string
+	// AdminAPI is the CRM's JSON API; AdminUI serves its single-page app.
+	AdminAPI http.Handler
+	AdminUI  http.Handler
 }
 
 // NewRouter wires the HTTP endpoints. When webhook is nil, the process exposes
@@ -28,6 +35,17 @@ func NewRouter(webhook *WhatsAppHandler, pool *worker.Pool, log *zap.Logger, cfg
 	}
 	if webhook != nil {
 		mux.Handle(path, webhook)
+	}
+
+	// The Admin CRM is a browser-facing concern mounted on the same server. It
+	// does not change the inbound WhatsApp transport in any way.
+	if cfg.AdminBasePath != "" && cfg.AdminAPI != nil {
+		base := strings.TrimSuffix(cfg.AdminBasePath, "/")
+		mux.Handle(base+"/api/", http.StripPrefix(base, cfg.AdminAPI))
+		if cfg.AdminUI != nil {
+			mux.Handle(base+"/", http.StripPrefix(base, cfg.AdminUI))
+			mux.Handle(base, http.RedirectHandler(base+"/", http.StatusMovedPermanently))
+		}
 	}
 
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
