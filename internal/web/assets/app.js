@@ -125,6 +125,7 @@ const state = {
   hasMoreMessages: false,
   attachment: null,
   stream: null,
+  streamClient: 0,
   busy: new Set(),
 };
 
@@ -262,7 +263,10 @@ async function setBotEnabled(next) {
   } finally {
     state.busy.delete("whatsapp-bot");
   }
-  await render();
+  // The switch lives in the sidebar. Re-rendering the whole screen for it would
+  // throw away whatever the consultant is reading or typing.
+  if (state.route.name === "settings") await render();
+  else syncSidebar();
 }
 
 function botConnectionLabel(status) {
@@ -474,16 +478,53 @@ function serviceStatusLabel(status, label) {
 
 /* --------------------------------------------------------- client detail */
 
+// lastRenderedDay tracks the date separator already on screen at the bottom of
+// the list.
+let lastRenderedDay = "";
+
+/* The chat is the one part of the CRM that must survive a refresh: a consultant
+ * is reading it and typing into it. These references let the view update the
+ * client panels around it while the message list, its scroll position and the
+ * composer stay exactly where they were. */
+const chat = {
+  clientID: 0,
+  panel: null,
+  scroll: null,
+  textarea: null,
+  fileInput: null,
+  seen: new Set(),
+  reset() {
+    this.clientID = 0;
+    this.panel = this.scroll = this.textarea = this.fileInput = null;
+    this.seen = new Set();
+    lastRenderedDay = "";
+  },
+  atBottom() {
+    if (!this.scroll) return true;
+    return this.scroll.scrollHeight - this.scroll.scrollTop - this.scroll.clientHeight < 80;
+  },
+  toBottom(force) {
+    if (!this.scroll) return;
+    if (force || this.atBottom()) {
+      requestAnimationFrame(() => { this.scroll.scrollTop = this.scroll.scrollHeight; });
+    }
+  },
+};
+
+// Slots rebuilt on a refresh. The chat column is deliberately absent.
+let clientSlots = null;
+
 async function ClientView(id) {
-  const [client, msgs, notes] = await Promise.all([
-    get(`/clients/${id}`),
-    get(`/clients/${id}/messages?limit=60`),
-    get(`/clients/${id}/notes`),
-  ]);
+  const [client, notes] = await Promise.all([get(`/clients/${id}`), get(`/clients/${id}/notes`)]);
   state.client = client;
-  state.messages = msgs.items;
-  state.hasMoreMessages = msgs.has_more;
   state.notes = notes.items;
+
+  const sameClient = chat.clientID && String(chat.clientID) === String(id);
+  if (!sameClient) {
+    const msgs = await get(`/clients/${id}/messages?limit=60`);
+    state.messages = msgs.items;
+    state.hasMoreMessages = msgs.has_more;
+  }
 
   if (client.unread > 0) {
     post(`/clients/${id}/read`).catch(() => {});
@@ -491,16 +532,71 @@ async function ClientView(id) {
   }
   startStream(id);
 
-  return el("div", {},
-    Topbar(client.name || client.phone,
-      statusChip(client.status, client.status_label),
-      modeChip(client.mode, client.blocked),
-      el("button", { class: "btn sm", onclick: () => navigate("clients") }, "← К списку")),
-    el("div", { class: "content" },
-      el("div", { class: "workspace" },
-        el("div", { class: "col col-sticky" }, ClientCard(client)),
-        el("div", { class: "col" }, ChatPanel(client)),
-        el("div", { class: "col crm col-sticky" }, CrmPanel(client)))));
+  const topbar = el("div", { class: "topbar-slot" }, ClientTopbar(client));
+  const card = el("div", { class: "col col-sticky pane pane-info" }, ClientCard(client));
+  const crm = el("div", { class: "col crm col-sticky pane pane-crm" }, CrmPanel(client));
+  const chatCol = el("div", { class: "col pane pane-chat" }, ChatPanel(client));
+
+  clientSlots = { topbar, card, crm };
+
+  return el("div", { class: "client-view", "data-pane": activePane },
+    topbar,
+    PaneTabs(),
+    el("div", { class: "content" }, el("div", { class: "workspace" }, card, chatCol, crm)));
+}
+
+function ClientTopbar(c) {
+  return Topbar(c.name || c.phone,
+    statusChip(c.status, c.status_label),
+    modeChip(c.mode, c.blocked),
+    c.bot_active ? null : el("span", { class: "chip" }, "Вне воронки"),
+    el("button", { class: "btn sm", onclick: () => navigate("clients") }, "← К списку"));
+}
+
+/* On a phone the three desktop columns become three tabs. Nothing is squeezed:
+ * one pane owns the screen at a time and the chat is the default. */
+const PANES = [["chat", "Чат"], ["info", "Клиент"], ["crm", "CRM"]];
+let activePane = "chat";
+
+function PaneTabs() {
+  const bar = el("div", { class: "pane-tabs" });
+  for (const [id, label] of PANES) {
+    bar.append(el("button", {
+      class: `pane-tab ${activePane === id ? "active" : ""}`,
+      "data-pane": id,
+      onclick: () => { activePane = id; applyPane(); },
+    }, label));
+  }
+  return bar;
+}
+
+function applyPane() {
+  const view = shell?.main.querySelector(".client-view");
+  if (!view) return;
+  view.dataset.pane = activePane;
+  for (const tab of view.querySelectorAll(".pane-tab")) {
+    tab.classList.toggle("active", tab.dataset.pane === activePane);
+  }
+  if (activePane === "chat") chat.toBottom(true);
+}
+
+// refreshClientMeta updates everything around the conversation from the server
+// without touching the message list or the composer.
+async function refreshClientMeta() {
+  const id = state.client?.id;
+  if (!id || !clientSlots) return;
+  try {
+    const [client, notes] = await Promise.all([get(`/clients/${id}`), get(`/clients/${id}/notes`)]);
+    state.client = client;
+    state.notes = notes.items;
+    clear(clientSlots.topbar).append(ClientTopbar(client));
+    clear(clientSlots.card).append(ClientCard(client));
+    clear(clientSlots.crm).append(CrmPanel(client));
+    updateComposerLock(client);
+    syncSidebar();
+  } catch (err) {
+    if (!(err instanceof HttpError && err.status === 401)) toast(err.message, "err");
+  }
 }
 
 function ClientCard(c) {
@@ -616,118 +712,254 @@ function TagEditor(c) {
 /* ------------------------------------------------------------------- chat */
 
 function ChatPanel(c) {
-  const scroll = el("div", { class: "chat-scroll" });
-  renderMessages(scroll);
-
-  if (state.hasMoreMessages) {
-    scroll.prepend(el("div", { style: "text-align:center;margin-bottom:10px" },
-      el("button", {
-        class: "btn sm",
-        onclick: async (e) => {
-          e.target.disabled = true;
-          const oldest = state.messages[0]?.id || 0;
-          try {
-            const older = await get(`/clients/${c.id}/messages?before=${oldest}&limit=60`);
-            state.messages = [...older.items, ...state.messages];
-            state.hasMoreMessages = older.has_more;
-            render();
-          } catch (err) { toast(err.message, "err"); }
-        },
-      }, "Загрузить раньше")));
+  // Rebuilding the conversation for the same client is what caused the reload
+  // look. It is built once and then only appended to.
+  if (chat.panel && String(chat.clientID) === String(c.id)) {
+    updateComposerLock(c);
+    chat.toBottom(true);
+    return chat.panel;
   }
 
-  const locked = c.mode !== "human";
-  const textarea = el("textarea", { placeholder: c.blocked ? "Клиент заблокирован" : "Сообщение клиенту…", disabled: c.blocked });
-  const fileInput = el("input", { type: "file", style: "display:none" });
-  const attachRow = el("div", {});
-  const sendBtn = el("button", { class: "btn primary", disabled: c.blocked }, "Отправить");
+  chat.reset();
+  chat.clientID = c.id;
+  chat.scroll = el("div", { class: "chat-scroll" });
+
+  const older = el("div", { class: "chat-older" });
+  chat.scroll.append(older);
+  renderOlderButton(older, c);
+  for (const m of state.messages) appendMessage(m);
+
+  chat.textarea = el("textarea", {
+    rows: 1,
+    placeholder: c.blocked ? "Клиент заблокирован" : "Сообщение клиенту…",
+    disabled: c.blocked,
+  });
+  chat.fileInput = el("input", { type: "file", style: "display:none" });
+
+  const attachRow = el("div", { class: "attach-row" });
+  const sendBtn = el("button", { class: "btn primary send-btn", disabled: c.blocked, title: "Отправить" }, "Отправить");
+  const attachBtn = el("button", { class: "btn attach-btn", disabled: c.blocked, title: "Прикрепить файл" }, "📎");
 
   const refreshAttach = () => {
     clear(attachRow);
     if (!state.attachment) return;
     attachRow.append(el("div", { class: "attach-preview" },
-      el("span", {}, "📎 ", state.attachment.name),
+      el("span", { class: "truncate" }, "📎 ", state.attachment.name),
       el("span", { class: "hint" }, fmtBytes(state.attachment.size)),
-      el("div", { class: "grow", style: "flex:1" }),
-      el("button", { class: "btn ghost sm", onclick: () => { state.attachment = null; fileInput.value = ""; refreshAttach(); } }, "×")));
+      el("div", { style: "flex:1" }),
+      el("button", {
+        class: "btn ghost sm",
+        onclick: () => { state.attachment = null; chat.fileInput.value = ""; refreshAttach(); },
+      }, "×")));
   };
 
-  fileInput.addEventListener("change", () => {
-    state.attachment = fileInput.files[0] || null;
+  chat.fileInput.addEventListener("change", () => {
+    state.attachment = chat.fileInput.files[0] || null;
     refreshAttach();
   });
+  attachBtn.addEventListener("click", () => chat.fileInput.click());
 
-  const send = async () => {
-    const text = textarea.value.trim();
-    if (!text && !state.attachment) return;
-    sendBtn.disabled = true;
-    sendBtn.textContent = "Отправка…";
-    try {
-      let res;
-      if (state.attachment) {
-        const form = new FormData();
-        form.append("file", state.attachment);
-        form.append("text", text);
-        if (/^audio\/(ogg|opus)/.test(state.attachment.type)) form.append("voice", "1");
-        res = await request(`/clients/${c.id}/messages`, { method: "POST", body: form });
-      } else {
-        res = await post(`/clients/${c.id}/messages`, { text });
-      }
-      textarea.value = "";
-      state.attachment = null;
-      fileInput.value = "";
-      if (res.warning) toast(res.warning, "err");
-      await reloadClient();
-    } catch (err) {
-      toast(err.message, "err");
-    } finally {
-      sendBtn.disabled = false;
-      sendBtn.textContent = "Отправить";
-    }
+  const autoGrow = () => {
+    chat.textarea.style.height = "auto";
+    chat.textarea.style.height = `${Math.min(chat.textarea.scrollHeight, 150)}px`;
   };
+  chat.textarea.addEventListener("input", autoGrow);
 
+  const send = () => sendFromComposer(c, sendBtn, refreshAttach, autoGrow);
   sendBtn.addEventListener("click", send);
-  textarea.addEventListener("keydown", (e) => {
+  chat.textarea.addEventListener("keydown", (e) => {
     if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) { e.preventDefault(); send(); }
   });
 
-  const composer = el("div", { class: `composer ${locked && !c.blocked ? "locked" : ""}` },
-    locked && !c.blocked
-      ? el("div", { class: "composer-note" },
-          el("span", {}, "Диалог ведёт ассистент. Отправка сообщения переведёт его на вас."),
-          el("button", { class: "btn sm", onclick: async () => { try { await post(`/clients/${c.id}/takeover`); await reloadClient(); } catch (err) { toast(err.message, "err"); } } }, "Взять сейчас"))
-      : null,
+  const note = el("div", { class: "composer-note" });
+  const composer = el("div", { class: "composer" },
+    note,
     attachRow,
-    el("div", { class: "composer-row" },
-      el("button", { class: "btn", disabled: c.blocked, onclick: () => fileInput.click(), title: "Прикрепить файл" }, "📎"),
-      textarea,
-      sendBtn),
-    fileInput,
-    el("div", { class: "hint", style: "margin-top:5px" }, "Ctrl+Enter — отправить. Фото, видео, аудио, голосовые и документы поддерживаются."));
+    el("div", { class: "composer-row" }, attachBtn, chat.textarea, sendBtn),
+    chat.fileInput,
+    el("div", { class: "hint composer-hint" }, "Ctrl+Enter — отправить. Фото, видео, аудио, голосовые и документы поддерживаются."));
 
-  const panel = el("div", { class: "panel" },
-    el("div", { class: "panel-head" }, "Переписка", el("div", { class: "grow" }),
-      el("span", { class: "hint" }, `${state.messages.length} сообщений`)),
-    el("div", { class: "chat" }, scroll, composer));
-
-  requestAnimationFrame(() => { scroll.scrollTop = scroll.scrollHeight; });
-  return panel;
+  chat.panel = el("div", { class: "panel chat-panel" },
+    el("div", { class: "chat" }, chat.scroll, composer));
+  chat.composerNote = note;
+  updateComposerLock(c);
+  chat.toBottom(true);
+  return chat.panel;
 }
 
-function renderMessages(scroll) {
-  if (!state.messages.length) {
-    scroll.append(el("div", { class: "empty" }, "Переписки пока нет"));
-    return;
+// updateComposerLock reflects who owns the conversation without rebuilding the
+// composer, so the consultant's half-typed message survives every refresh.
+function updateComposerLock(c) {
+  if (!chat.panel || !chat.composerNote) return;
+  const composer = chat.panel.querySelector(".composer");
+  const locked = c.mode !== "human" && !c.blocked;
+  composer.classList.toggle("locked", locked);
+  clear(chat.composerNote);
+  if (!locked) { chat.composerNote.style.display = "none"; return; }
+  chat.composerNote.style.display = "";
+  chat.composerNote.append(
+    el("span", {}, "Диалог ведёт ассистент. Отправка сообщения переведёт его на вас."),
+    el("button", {
+      class: "btn sm",
+      onclick: async () => {
+        try { await post(`/clients/${c.id}/takeover`); await refreshClientMeta(); }
+        catch (err) { toast(err.message, "err"); }
+      },
+    }, "Взять сейчас"));
+
+  const blocked = !!c.blocked;
+  for (const node of [chat.textarea, ...composer.querySelectorAll("button.attach-btn, button.send-btn")]) {
+    if (node) node.disabled = blocked;
   }
-  let lastDay = "";
-  for (const m of state.messages) {
-    const day = new Date(m.created_at).toDateString();
-    if (day !== lastDay) {
-      lastDay = day;
-      scroll.append(el("div", { class: "chat-day" }, el("span", {}, fmtDate(m.created_at))));
+}
+
+function renderOlderButton(host, c) {
+  clear(host);
+  if (!state.hasMoreMessages) return;
+  host.append(el("button", {
+    class: "btn sm",
+    onclick: async (e) => {
+      e.target.disabled = true;
+      const oldest = state.messages[0]?.id || 0;
+      try {
+        const older = await get(`/clients/${c.id}/messages?before=${oldest}&limit=60`);
+        state.messages = [...older.items, ...state.messages];
+        state.hasMoreMessages = older.has_more;
+        const anchor = chat.scroll.scrollHeight - chat.scroll.scrollTop;
+        prependOlder(older.items);
+        renderOlderButton(host, c);
+        chat.scroll.scrollTop = chat.scroll.scrollHeight - anchor;
+      } catch (err) {
+        e.target.disabled = false;
+        toast(err.message, "err");
+      }
+    },
+  }, "Загрузить раньше"));
+}
+
+let tempSeq = 0;
+
+// sendFromComposer shows the message immediately, then reconciles it with the
+// row the server actually stored. A failure is shown as a failure; it is never
+// presented as delivered.
+async function sendFromComposer(c, sendBtn, refreshAttach, autoGrow) {
+  const text = chat.textarea.value.trim();
+  const attachment = state.attachment;
+  if (!text && !attachment) return;
+
+  const tempID = `tmp-${++tempSeq}`;
+  appendMessage({
+    id: tempID,
+    direction_type: "outbound",
+    sender_type: "consultant",
+    type: attachment ? "document" : "text",
+    text: text || (attachment ? `📎 ${attachment.name}` : ""),
+    created_at: new Date().toISOString(),
+    delivery: "sending",
+  });
+  chat.toBottom(true);
+
+  chat.textarea.value = "";
+  chat.textarea.disabled = true;
+  sendBtn.disabled = true;
+  state.attachment = null;
+  if (chat.fileInput) chat.fileInput.value = "";
+  refreshAttach();
+  autoGrow();
+
+  try {
+    let res;
+    if (attachment) {
+      const form = new FormData();
+      form.append("file", attachment);
+      form.append("text", text);
+      if (/^audio\/(ogg|opus)/.test(attachment.type)) form.append("voice", "1");
+      res = await request(`/clients/${c.id}/messages`, { method: "POST", body: form });
+    } else {
+      res = await post(`/clients/${c.id}/messages`, { text });
     }
-    scroll.append(MessageBubble(m));
+    replaceMessage(tempID, res.message);
+    if (res.warning) toast(res.warning, "err");
+  } catch (err) {
+    markMessageFailed(tempID, err.message);
+    toast(err.message, "err");
+  } finally {
+    chat.textarea.disabled = !!c.blocked;
+    sendBtn.disabled = !!c.blocked;
+    chat.textarea.focus();
   }
+  // The mode chip and the follow-up plan changed; the conversation did not.
+  refreshClientMeta();
+}
+
+/* --------------------------------------------------- message list updates */
+
+function messageNode(id) {
+  return chat.scroll?.querySelector(`[data-msg="${CSS.escape(String(id))}"]`) || null;
+}
+
+function appendMessage(m) {
+  if (!chat.scroll) return;
+  const key = String(m.id);
+  if (chat.seen.has(key)) return;
+  chat.seen.add(key);
+  const stick = chat.atBottom();
+  const divider = dayDivider(m);
+  if (divider) chat.scroll.append(divider);
+  chat.scroll.append(MessageBubble(m));
+  chat.toBottom(stick);
+}
+
+// prependOlder inserts a page of earlier messages above the current ones, with
+// their own date separators, directly after the "load earlier" button.
+function prependOlder(items) {
+  if (!chat.scroll || !items.length) return;
+  const fragment = document.createDocumentFragment();
+  let day = "";
+  for (const m of items) {
+    const key = String(m.id);
+    if (chat.seen.has(key)) continue;
+    chat.seen.add(key);
+    const itemDay = new Date(m.created_at).toDateString();
+    if (itemDay !== day) {
+      day = itemDay;
+      fragment.append(el("div", { class: "chat-day" }, el("span", {}, fmtDate(m.created_at))));
+    }
+    fragment.append(MessageBubble(m));
+  }
+  const older = chat.scroll.querySelector(".chat-older");
+  chat.scroll.insertBefore(fragment, older ? older.nextSibling : chat.scroll.firstChild);
+}
+
+function replaceMessage(tempID, canonical) {
+  const node = messageNode(tempID);
+  chat.seen.delete(String(tempID));
+  if (!canonical) { node?.remove(); return; }
+  if (chat.seen.has(String(canonical.id))) { node?.remove(); return; }
+  chat.seen.add(String(canonical.id));
+  state.messages.push(canonical);
+  const fresh = MessageBubble(canonical);
+  if (node) node.replaceWith(fresh);
+  else chat.scroll?.append(fresh);
+  chat.toBottom(true);
+}
+
+function markMessageFailed(tempID, reason) {
+  const node = messageNode(tempID);
+  if (!node) return;
+  node.classList.add("failed");
+  const meta = node.querySelector(".meta");
+  if (meta) { clear(meta).append(fmtTime(new Date().toISOString()), " · ", el("span", { class: "fail" }, "не отправлено")); }
+  node.title = reason || "";
+}
+
+// dayDivider returns a date separator only when the day actually changes, so
+// the list carries one per day rather than one per message.
+function dayDivider(m) {
+  const day = new Date(m.created_at).toDateString();
+  if (day === lastRenderedDay) return null;
+  lastRenderedDay = day;
+  return el("div", { class: "chat-day" }, el("span", {}, fmtDate(m.created_at)));
 }
 
 const SENDER_LABEL = { client: "Клиент", ai: "Ассистент", consultant: "Консультант", system: "Система" };
@@ -735,7 +967,7 @@ const SENDER_LABEL = { client: "Клиент", ai: "Ассистент", consult
 function MessageBubble(m) {
   const sender = m.sender_type || m.sender;
   if (sender === "system") {
-    return el("div", { class: "msg sys" }, el("div", { class: "bubble" }, m.text));
+    return el("div", { class: "msg sys", "data-msg": String(m.id) }, el("div", { class: "bubble" }, m.text));
   }
   const out = m.direction_type ? m.direction_type === "outbound" : m.direction === "outgoing";
   const bubble = el("div", { class: "bubble" });
@@ -748,10 +980,14 @@ function MessageBubble(m) {
 
   const meta = el("div", { class: "meta" }, fmtTime(m.created_at));
   if (out && m.delivery === "failed") meta.append(" · ", el("span", { class: "fail" }, "не доставлено"));
+  else if (out && m.delivery === "sending") meta.append(" · ", el("span", { class: "hint" }, "отправляется…"));
   else if (out && m.delivery === "sent") meta.append(" · ✓");
   bubble.append(meta);
 
-  return el("div", { class: `msg ${out ? "out" : "in"} ${sender === "consultant" ? "consultant" : ""}` }, bubble);
+  return el("div", {
+    class: `msg ${out ? "out" : "in"} ${sender === "consultant" ? "consultant" : ""} ${m.delivery === "sending" ? "sending" : ""}`,
+    "data-msg": String(m.id),
+  }, bubble);
 }
 
 function MediaBlock(m) {
@@ -1121,40 +1357,56 @@ async function SettingsView() {
 
 /* ------------------------------------------------------------------ live */
 
+// startStream keeps one connection per client. Reconnecting on every update is
+// both wasteful and a source of missed events.
 function startStream(clientID) {
+  if (state.stream && String(state.streamClient) === String(clientID)) return;
   stopStream();
   try {
     const url = clientID ? `${API}/events?client_id=${clientID}` : `${API}/events`;
     const source = new EventSource(url, { withCredentials: true });
     source.addEventListener("client.changed", () => {
       if (state.route.name === "client" && Number(state.route.params.id) === Number(clientID)) {
-        reloadMessages().catch(() => {});
+        pullNewMessages().catch(() => {});
       }
     });
     source.onerror = () => { /* the browser reconnects on its own */ };
     state.stream = source;
-  } catch { state.stream = null; }
+    state.streamClient = clientID;
+  } catch { state.stream = null; state.streamClient = 0; }
 }
 
 function stopStream() {
   if (state.stream) { state.stream.close(); state.stream = null; }
+  state.streamClient = 0;
 }
 
-async function reloadMessages() {
+// pullNewMessages fetches only what arrived after the newest message on screen
+// and appends it. The conversation is never re-fetched or re-rendered whole.
+async function pullNewMessages() {
   const id = state.client?.id;
   if (!id) return;
-  const after = state.messages.length ? state.messages[state.messages.length - 1].id : 0;
+  const stored = state.messages.filter((m) => typeof m.id === "number");
+  const after = stored.length ? stored[stored.length - 1].id : 0;
   const fresh = await get(`/clients/${id}/messages?after=${after}`);
   if (!fresh.items.length) return;
-  state.messages = [...state.messages, ...fresh.items];
-  const client = await get(`/clients/${id}`);
-  state.client = client;
+  for (const m of fresh.items) {
+    state.messages.push(m);
+    appendMessage(m);
+  }
   post(`/clients/${id}/read`).catch(() => {});
-  render();
+  refreshClientMeta();
 }
 
+// reloadClient refreshes the panels around the conversation. On any other
+// screen it falls back to a normal render.
 async function reloadClient() {
   if (!state.client) return;
+  if (state.route.name === "client" && clientSlots) {
+    await refreshClientMeta();
+    await pullNewMessages().catch(() => {});
+    return;
+  }
   await render();
 }
 
@@ -1207,34 +1459,73 @@ async function bootstrap() {
 
 const root = document.getElementById("app");
 
+/* The application shell is mounted once and kept. Re-rendering it on every
+ * update is what used to make the CRM look like it was reloading: the sidebar,
+ * the chat and the composer were all thrown away and rebuilt, so the page
+ * flashed, the scroll jumped and the message box lost focus. */
+let shell = null;
+let renderedRoute = "";
+let renderToken = 0;
+
+const routeKey = (route) => `${route.name}:${route.params.id || ""}`;
+
+function mountShell() {
+  const main = el("main", { class: "main" });
+  const sidebar = Sidebar();
+  shell = { node: el("div", { class: "shell" }, sidebar, main), main };
+  root.className = "";
+  clear(root).append(shell.node, toastHost);
+}
+
 async function render() {
   if (!state.user) {
     stopStream();
+    shell = null;
+    renderedRoute = "";
     root.className = "";
     clear(root).append(LoginView(), toastHost);
     return;
   }
 
   state.route = parseHash();
-  if (state.route.name !== "client") { stopStream(); state.client = null; }
+  const key = routeKey(state.route);
+  if (state.route.name !== "client") { stopStream(); state.client = null; chat.reset(); }
+  if (state.route.name === "client" && chat.clientID && String(chat.clientID) !== String(state.route.params.id)) {
+    chat.reset();
+  }
 
-  const main = el("main", { class: "main" });
-  root.className = "";
-  clear(root).append(el("div", { class: "shell" }, Sidebar(), main), toastHost);
-  main.append(el("div", { class: "content" }, el("div", { class: "skeleton", style: "width:180px" })));
+  if (!shell) mountShell();
+
+  // A skeleton belongs to a navigation, not to a refresh of the screen the user
+  // is already looking at. Showing it on every update is the flicker.
+  const navigating = key !== renderedRoute;
+  const token = ++renderToken;
+  if (navigating) {
+    clear(shell.main).append(el("div", { class: "content" }, el("div", { class: "skeleton", style: "width:180px" })));
+  }
 
   const view = VIEWS[state.route.name] || DashboardView;
   try {
     const node = await view(state.route.params);
-    clear(main).append(node);
-    // The sidebar counters may have moved while the view was loading.
-    root.querySelector(".sidebar").replaceWith(Sidebar());
+    if (token !== renderToken) return; // a newer render already won
+    clear(shell.main).append(node);
+    renderedRoute = key;
+    syncSidebar();
   } catch (err) {
+    if (token !== renderToken) return;
     if (err instanceof HttpError && err.status === 401) return;
-    clear(main).append(Topbar("Ошибка"), el("div", { class: "content" },
+    renderedRoute = "";
+    clear(shell.main).append(Topbar("Ошибка"), el("div", { class: "content" },
       el("div", { class: "error-box" }, err.message),
       el("button", { class: "btn", onclick: () => render() }, "Повторить")));
   }
+}
+
+// syncSidebar replaces only the navigation column, so counters stay current
+// without disturbing the view the user is working in.
+function syncSidebar() {
+  const current = shell?.node.querySelector(".sidebar");
+  if (current) current.replaceWith(Sidebar());
 }
 
 window.addEventListener("hashchange", () => { render(); });

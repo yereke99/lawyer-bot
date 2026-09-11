@@ -149,10 +149,38 @@ type greenWebhookPayload struct {
 	} `json:"messageData"`
 }
 
+// EventKind reports the provider's own name for an event, so a handler can say
+// in the log exactly what it ignored. Meta batches carry no single kind and
+// report "meta_batch".
+func EventKind(body []byte) string {
+	var probe struct {
+		TypeWebhook string `json:"typeWebhook"`
+	}
+	if err := json.Unmarshal(body, &probe); err != nil {
+		return "unparseable"
+	}
+	if probe.TypeWebhook != "" {
+		return probe.TypeWebhook
+	}
+	return "meta_batch"
+}
+
+// IsInboundEventKind reports whether a provider event kind carries a message
+// the bot may react to. Everything our own account sends comes back as an
+// outgoing event and is rejected here, which is what stops an admin's own
+// message from being read as customer input.
+func IsInboundEventKind(kind string) bool {
+	return kind == greenIncomingMessage || kind == "meta_batch"
+}
+
+// greenIncomingMessage is the only Green API event the bot reacts to.
+const greenIncomingMessage = "incomingMessageReceived"
+
 // ParseWebhook converts a raw webhook body into provider-independent messages.
 //
-// Delivery-status callbacks and other non-message events yield an empty slice:
-// the bot only ever reacts to real incoming messages.
+// Delivery-status callbacks, outgoing-message echoes of our own account and
+// every other non-message event yield an empty slice: the bot only ever reacts
+// to real incoming messages from a customer.
 func ParseWebhook(body []byte) ([]domain.InboundMessage, error) {
 	var probe struct {
 		TypeWebhook string `json:"typeWebhook"`
@@ -193,8 +221,17 @@ func parseGreenWebhook(body []byte) ([]domain.InboundMessage, error) {
 	if err := json.Unmarshal(body, &payload); err != nil {
 		return nil, fmt.Errorf("decode green api webhook payload: %w", err)
 	}
-	if payload.TypeWebhook != "incomingMessageReceived" {
+	if payload.TypeWebhook != greenIncomingMessage {
 		return nil, nil
+	}
+	// Defence in depth against an echo loop: Green API delivers our own sends as
+	// outgoing events, but if an instance is ever configured to report them as
+	// incoming, the sender is still our own WhatsApp ID and must be dropped.
+	if own := strings.TrimSpace(payload.InstanceData.WID); own != "" {
+		sender := firstNonEmpty(payload.SenderData.Sender, payload.SenderData.ChatID)
+		if strings.EqualFold(greenPhoneNumber(sender), greenPhoneNumber(own)) {
+			return nil, nil
+		}
 	}
 	return []domain.InboundMessage{convertGreenMessage(payload)}, nil
 }

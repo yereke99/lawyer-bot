@@ -181,7 +181,7 @@ select { cursor: pointer; }
 
 /* ----------------------------------------------------------------- tables */
 
-.table-wrap { overflow-x: auto; }
+.table-wrap { overflow-x: auto; -webkit-overflow-scrolling: touch; }
 table { width: 100%; border-collapse: collapse; font-size: 13px; }
 thead th {
   text-align: left; padding: 8px 12px; font-size: 11.5px; font-weight: 600;
@@ -292,11 +292,34 @@ td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
   background: var(--surface-2); border: 1px solid var(--border); border-radius: var(--radius); font-size: 12.5px;
 }
 
-.composer { border-top: 1px solid var(--border); padding: 10px 12px; background: var(--surface); }
+.chat-panel { overflow: hidden; }
+.chat-older { text-align: center; margin-bottom: 10px; }
+.chat-older:empty { display: none; }
+.msg.sending .bubble { opacity: .68; }
+.msg.failed .bubble { border-color: #f0cdca; background: var(--red-soft); }
+
+.composer {
+  border-top: 1px solid var(--border); padding: 10px 12px; background: var(--surface);
+  padding-bottom: max(10px, env(safe-area-inset-bottom));
+}
 .composer.locked { background: var(--amber-soft); }
-.composer-note { font-size: 12px; color: var(--amber); margin-bottom: 8px; display: flex; align-items: center; gap: 8px; }
+.composer-note { font-size: 12px; color: var(--amber); margin-bottom: 8px; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
 .composer-row { display: flex; gap: 8px; align-items: flex-end; }
-.composer textarea { min-height: 40px; max-height: 160px; }
+.composer textarea { min-height: 40px; max-height: 150px; resize: none; overflow-y: auto; }
+.composer .attach-btn { flex: 0 0 auto; }
+.composer .send-btn { flex: 0 0 auto; }
+.attach-row:empty { display: none; }
+
+/* ------------------------------------------------------------- pane tabs */
+/* Three desktop columns become three tabs below 900px: one pane owns the
+   screen instead of every column being squeezed into a phone. */
+
+.pane-tabs { display: none; }
+.pane-tab {
+  flex: 1; padding: 11px 8px; background: var(--surface); border: none;
+  border-bottom: 2px solid transparent; color: var(--text-2); font-size: 13.5px; font-weight: 500;
+}
+.pane-tab.active { color: var(--accent); border-bottom-color: var(--accent); }
 .attach-preview {
   display: flex; align-items: center; gap: 8px; font-size: 12.5px; margin-bottom: 7px;
   background: var(--surface-2); border: 1px solid var(--border); border-radius: var(--radius); padding: 5px 9px;
@@ -342,21 +365,82 @@ td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
 
 /* ------------------------------------------------------------- responsive */
 
-@media (max-width: 1280px) {
+@media (max-width: 1440px) {
+  .workspace { grid-template-columns: 250px minmax(0, 1fr) 280px; gap: 12px; }
+}
+
+@media (max-width: 1180px) {
+  /* The CRM column drops under the conversation rather than shrinking both. */
   .workspace { grid-template-columns: 240px minmax(0, 1fr); }
   .workspace > .col.crm { grid-column: 1 / -1; }
   .col-sticky { position: static; max-height: none; }
+  .chat { height: min(72vh, calc(100vh - 150px)); }
 }
+
 @media (max-width: 900px) {
   .shell { grid-template-columns: 1fr; }
-  .sidebar { position: static; height: auto; flex-direction: row; align-items: center; overflow-x: auto; }
+  .sidebar {
+    position: sticky; top: 0; z-index: 20; height: auto;
+    flex-direction: row; align-items: center; overflow-x: auto;
+    border-right: none; border-bottom: 1px solid var(--border);
+    -webkit-overflow-scrolling: touch;
+  }
   .brand { border-bottom: none; border-right: 1px solid var(--border); white-space: nowrap; }
   .nav { display: flex; gap: 4px; padding: 8px; }
-  .nav a { white-space: nowrap; }
-  .bot-card { min-width: 170px; margin: 8px; }
+  .nav a { white-space: nowrap; padding: 9px 12px; }
+  .bot-card { min-width: 0; margin: 6px 8px; padding: 6px 9px; }
+  .bot-card .bot-status { display: none; }
+  .bot-title { font-size: 11px; }
   .sidebar-foot { display: none; }
-  .workspace { grid-template-columns: 1fr; }
-  .chat { height: 68vh; }
-  .content { padding: 14px; }
-  .bar-row { grid-template-columns: 120px 1fr 40px; }
+  .content { padding: 12px; }
+  .bar-row { grid-template-columns: 110px 1fr 40px; }
+  .metrics { grid-template-columns: repeat(auto-fill, minmax(140px, 1fr)); }
+
+  /* One pane at a time on the client screen. */
+  .pane-tabs { display: flex; border-bottom: 1px solid var(--border); background: var(--surface); position: sticky; top: 0; z-index: 10; }
+  .workspace { grid-template-columns: 1fr; gap: 0; }
+  .client-view .pane { display: none; }
+  .client-view[data-pane="chat"] .pane-chat,
+  .client-view[data-pane="info"] .pane-info,
+  .client-view[data-pane="crm"] .pane-crm { display: block; }
+  .client-view .content { padding: 0; }
+  .client-view .pane-info,
+  .client-view .pane-crm { padding: 12px; }
+  .chat-panel { border-radius: 0; border-left: none; border-right: none; }
+
+  /* The conversation fills whatever the header and tabs leave, so the message
+     box is always reachable instead of being pushed below the fold. */
+  .shell { height: 100dvh; grid-template-rows: auto minmax(0, 1fr); }
+  .main { min-height: 0; overflow-y: auto; display: flex; flex-direction: column; }
+  .client-view { display: flex; flex-direction: column; flex: 1; min-height: 0; }
+  .client-view .content { flex: 1; min-height: 0; display: flex; }
+  .client-view .workspace { flex: 1; min-height: 0; }
+  .client-view[data-pane="chat"] .pane-chat { height: 100%; }
+  .client-view[data-pane="chat"] .chat-panel,
+  .client-view[data-pane="chat"] .chat { height: 100%; }
+  .client-view[data-pane="info"] .pane-info,
+  .client-view[data-pane="crm"] .pane-crm { overflow-y: auto; }
+  .bubble { max-width: 88%; }
+  .topbar { flex-wrap: wrap; row-gap: 6px; padding: 10px 12px; }
+  .topbar h1 { font-size: 15px; }
+
+  /* Touch targets. */
+  .btn { min-height: 38px; }
+  .pane-tab { min-height: 44px; }
+  .composer textarea { font-size: 16px; } /* stops iOS from zooming on focus */
 }
+
+@media (max-width: 520px) {
+  .filters { display: grid; grid-template-columns: 1fr 1fr; align-items: end; }
+  .filters .field { min-width: 0; }
+  .filters > .btn { grid-column: 1 / -1; }
+  .metrics { grid-template-columns: 1fr 1fr; }
+  .kv { grid-template-columns: 92px 1fr; }
+  .actions .btn { flex: 1 1 100%; }
+  .modal { max-width: 100%; }
+  .toasts { left: 12px; right: 12px; bottom: 12px; }
+  .toast { max-width: none; }
+  .composer-hint { display: none; }
+  .send-btn { padding-left: 12px; padding-right: 12px; }
+}
+

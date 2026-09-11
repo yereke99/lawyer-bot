@@ -25,7 +25,8 @@ func NewUserRepository(db *DB) *UserRepository {
 
 const userColumns = `id, whatsapp_user_id, phone_number, display_name, language,
 	current_state, detected_service, lead_score, is_lead,
-	first_seen_at, last_seen_at, created_at, updated_at`
+	first_seen_at, last_seen_at, created_at, updated_at,
+	bot_activated_at, bot_trigger`
 
 // Upsert creates the user on first contact and refreshes the volatile contact
 // fields on every later message. It never overwrites a known value with an
@@ -106,6 +107,30 @@ func (r *UserRepository) SetState(ctx context.Context, userID int64, state domai
 	return nil
 }
 
+// ActivateBotSession records that the contact entered the funnel themselves.
+//
+// The write is conditional on the session not already being open, so a repeated
+// trigger message never moves the activation timestamp and never turns a
+// long-running conversation back into a fresh one. It reports whether this call
+// was the one that opened the session.
+func (r *UserRepository) ActivateBotSession(ctx context.Context, userID int64, trigger string, at time.Time) (bool, error) {
+	if at.IsZero() {
+		at = time.Now().UTC()
+	}
+	res, err := r.db.ExecContext(ctx, `
+		UPDATE users SET bot_activated_at = ?, bot_trigger = ?, updated_at = ?
+		WHERE id = ? AND bot_activated_at IS NULL`,
+		at.UTC(), truncateRunes(trigger, 120), time.Now().UTC(), userID)
+	if err != nil {
+		return false, fmt.Errorf("activate bot session: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("activate bot session: %w", err)
+	}
+	return n > 0, nil
+}
+
 // SetPhone stores a phone number collected from the conversation.
 func (r *UserRepository) SetPhone(ctx context.Context, userID int64, phone string) error {
 	_, err := r.db.ExecContext(ctx,
@@ -119,14 +144,16 @@ func (r *UserRepository) SetPhone(ctx context.Context, userID int64, phone strin
 
 func scanUser(row *sql.Row) (*domain.User, error) {
 	var (
-		u      domain.User
-		lang   string
-		state  string
-		isLead int
+		u         domain.User
+		lang      string
+		state     string
+		isLead    int
+		activated sql.NullTime
 	)
 	err := row.Scan(&u.ID, &u.WhatsAppUserID, &u.PhoneNumber, &u.DisplayName, &lang,
 		&state, &u.DetectedService, &u.LeadScore, &isLead,
-		&u.FirstSeenAt, &u.LastSeenAt, &u.CreatedAt, &u.UpdatedAt)
+		&u.FirstSeenAt, &u.LastSeenAt, &u.CreatedAt, &u.UpdatedAt,
+		&activated, &u.BotTrigger)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrNotFound
 	}
@@ -136,6 +163,7 @@ func scanUser(row *sql.Row) (*domain.User, error) {
 	u.Language = domain.Language(lang)
 	u.CurrentState = domain.ConversationState(state)
 	u.IsLead = isLead != 0
+	u.BotActivatedAt = nullTime(activated)
 	return &u, nil
 }
 

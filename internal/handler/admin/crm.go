@@ -623,6 +623,13 @@ func (a *API) handleEvents(w http.ResponseWriter, r *http.Request) {
 	}
 	clientID := int64(service.ParseInt(r.URL.Query().Get("client_id"), 0))
 
+	// An event stream outlives the server's write timeout by design, so the
+	// deadline is cleared for this one response. Without it the browser is
+	// disconnected every thirty seconds and the live view flaps.
+	if err := http.NewResponseController(w).SetWriteDeadline(time.Time{}); err != nil {
+		a.log.Debug("event stream write deadline not clearable", zap.Error(err))
+	}
+
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-store")
 	w.Header().Set("Connection", "keep-alive")

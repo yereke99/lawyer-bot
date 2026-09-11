@@ -113,6 +113,10 @@ func (p *GreenAPIPoller) handleNotification(ctx context.Context, notification *w
 		payload = string(notification.Body)
 	}
 
+	kind := whatsapp.EventKind(notification.Body)
+	log = log.With(zap.String("event", kind))
+	log.Info("provider event received")
+
 	messages, parseErr := whatsapp.ParseWebhook(notification.Body)
 	if parseErr != nil {
 		p.storePollingEvent(ctx, domain.WebhookEvent{
@@ -129,6 +133,20 @@ func (p *GreenAPIPoller) handleNotification(ctx context.Context, notification *w
 		TraceID: traceID, Provider: "greenapi", Payload: payload,
 		MessageCount: len(messages), Status: "received",
 	})
+
+	if len(messages) == 0 {
+		// Delivery receipts, status callbacks and the echoes of everything this
+		// account sends itself end here. They are never customer input.
+		reason := "unsupported_event"
+		if !whatsapp.IsInboundEventKind(kind) {
+			reason = "own_outgoing_or_status_event"
+		}
+		log.Info("provider event ignored", zap.String("reason", reason))
+		if err := p.client.DeleteNotification(ctx, notification.ReceiptID); err != nil {
+			return fmt.Errorf("delete green api notification: %w", err)
+		}
+		return nil
+	}
 
 	messages = privateWhatsAppMessages(messages, log)
 	for i, msg := range messages {

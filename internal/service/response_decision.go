@@ -36,6 +36,11 @@ const (
 // DecisionInput carries everything the deterministic engine needs. The model's
 // own `should_respond` field is present but is treated as advice only.
 type DecisionInput struct {
+	// SessionActive is true when the customer entered the funnel with the
+	// configured trigger. An active customer who writes always gets an answer:
+	// the filters that protect a stranger from an unsolicited message would
+	// otherwise abandon a conversation mid-flow.
+	SessionActive  bool
 	TriggerMatched bool
 	Trigger        TriggerMatch
 	AICalled       bool
@@ -108,21 +113,36 @@ func ShouldRespond(in DecisionInput) Decision {
 		service = in.KnownService
 	}
 
-	// The message is not about legal services. Store it, say nothing.
-	if !ai.IsRelevant {
-		return silent(ReasonAIMarkedIrrelevant)
-	}
-	if ai.Intent == domain.IntentGreeting && !in.TriggerMatched {
-		return silent(ReasonGreetingOnly)
-	}
-	if ai.Intent == domain.IntentIrrelevant {
-		return silent(ReasonNotLegalIntent)
+	// Off-topic handling splits on whether this person is in the funnel. A
+	// stranger is left alone; a customer mid-conversation is answered and
+	// steered back, because dropping their message is what kills the dialogue.
+	offTopic := !ai.IsRelevant ||
+		ai.Intent == domain.IntentIrrelevant ||
+		(ai.Intent == domain.IntentGreeting && !in.TriggerMatched)
+	if offTopic {
+		if !in.SessionActive {
+			switch {
+			case !ai.IsRelevant:
+				return silent(ReasonAIMarkedIrrelevant)
+			case ai.Intent == domain.IntentGreeting:
+				return silent(ReasonGreetingOnly)
+			default:
+				return silent(ReasonNotLegalIntent)
+			}
+		}
+		return Decision{
+			Respond:   true,
+			Action:    ActionClarify,
+			Reason:    ReasonContinueFlow,
+			Service:   service,
+			NextState: continuationState(in.State),
+		}
 	}
 
 	// Low confidence: never guess at a stranger. Inside an active flow a single
 	// short clarification is preferable to dropping a live conversation.
 	if ai.Confidence < in.MinConfidence {
-		if in.State.Active() {
+		if in.State.Active() || in.SessionActive {
 			return Decision{
 				Respond:   true,
 				Action:    ActionClarify,
@@ -142,8 +162,9 @@ func ShouldRespond(in DecisionInput) Decision {
 		return silent(ReasonLowConfidenceNew)
 	}
 
-	// The handoff already happened. Only a fresh, specific service request
-	// reopens the conversation; small talk after handoff stays unanswered.
+	// The handoff already happened. A fresh, specific service request always
+	// reopens the conversation. For a customer inside a funnel session so does
+	// anything else they write: they are mid-dialogue and waiting for an answer.
 	if in.State == domain.StateReadyForDiana || in.State == domain.StateCompleted {
 		if service != "" && service != in.KnownService {
 			return Decision{
@@ -154,7 +175,16 @@ func ShouldRespond(in DecisionInput) Decision {
 				NextState: domain.StateQualifying,
 			}
 		}
-		return silent(ReasonAlreadyHandedOff)
+		if !in.SessionActive {
+			return silent(ReasonAlreadyHandedOff)
+		}
+		return Decision{
+			Respond:   true,
+			Action:    ActionServiceInfo,
+			Reason:    ReasonContinueFlow,
+			Service:   service,
+			NextState: in.State,
+		}
 	}
 
 	// A concrete service is on the table.
@@ -225,14 +255,24 @@ func ShouldRespond(in DecisionInput) Decision {
 		}
 	}
 
-	if in.State.Active() {
+	if in.State.Active() || in.SessionActive {
 		return Decision{
 			Respond:   true,
 			Action:    ActionClarify,
 			Reason:    ReasonContinueFlow,
 			Service:   service,
-			NextState: domain.StateQualifying,
+			NextState: continuationState(in.State),
 		}
 	}
 	return silent(ReasonNotLegalIntent)
+}
+
+// continuationState keeps a conversation that already reached handoff where it
+// is, and moves anything earlier into qualification. Re-opening a handed-off
+// lead on an off-topic remark would undo the consultant's own view of it.
+func continuationState(current domain.ConversationState) domain.ConversationState {
+	if current == domain.StateReadyForDiana || current == domain.StateCompleted {
+		return current
+	}
+	return domain.StateQualifying
 }

@@ -18,10 +18,20 @@ import (
 // Trace stages added by the CRM layer.
 const (
 	StageWhatsAppChatGate = "whatsapp_chat_gate"
+	StageSessionGate      = "bot_session_gate"
+	StageSessionOpened    = "bot_session_activated"
 	StageCRMGate          = "crm_gate"
 	StageCRMState         = "crm_state_updated"
 	StageFollowUpPlan     = "follow_up_scheduled"
 	StageMediaStored      = "media_stored"
+)
+
+// Session gate reasons, recorded verbatim so silence is always explainable.
+const (
+	SessionReasonActive      = "session_active"
+	SessionReasonActivated   = "trigger_matched"
+	SessionReasonNoTrigger   = "no_session_and_no_trigger"
+	SessionReasonNotEligible = "message_type_cannot_activate"
 )
 
 // CRM gate reasons, recorded verbatim so silence is always explainable.
@@ -58,6 +68,64 @@ func crmGate(client *domain.CRMClient) (string, bool) {
 	default:
 		return CRMReasonOK, true
 	}
+}
+
+// sessionGate is the funnel entry point and the rule that the assistant never
+// speaks first.
+//
+// A contact who already opened a session keeps it: every later private message
+// is processed. A contact who has not must send an activation trigger; anything
+// else is stored and traced, and the bot stays silent.
+//
+// Activation is a durable, conditional write, so two deliveries of the same
+// trigger cannot open two sessions or reset an existing one.
+func (p *Pipeline) sessionGate(ctx context.Context, log *zap.Logger, user *domain.User,
+	in domain.InboundMessage, messageID int64) (string, bool) {
+
+	if user.BotSessionActive() {
+		return SessionReasonActive, true
+	}
+
+	match := p.activate.Match(in.Content(), in.MessageType)
+	if !match.Matched {
+		reason := SessionReasonNoTrigger
+		if !in.MessageType.Analyzable() {
+			reason = SessionReasonNotEligible
+		}
+		p.event(ctx, domain.TraceEvent{TraceID: in.TraceID, UserID: user.ID, MessageID: messageID,
+			Stage: StageSessionGate, Decision: domain.DecisionSilent, Reason: reason})
+		log.Info("private message ignored: contact is not in the funnel",
+			zap.String("reason", reason),
+			zap.String("type", string(in.MessageType)))
+		return reason, false
+	}
+
+	at := in.Timestamp
+	if at.IsZero() {
+		at = time.Now().UTC()
+	}
+	opened, err := p.users.ActivateBotSession(ctx, user.ID, match.Kind+":"+match.Trigger, at)
+	if err != nil {
+		p.event(ctx, domain.TraceEvent{TraceID: in.TraceID, UserID: user.ID, MessageID: messageID,
+			Stage: StageSessionGate, Decision: domain.DecisionError,
+			Reason: "session_activation_failed", Detail: errDetail(err)})
+		log.Error("activate bot session failed", zap.Error(err))
+		return "session_activation_failed", false
+	}
+	user.BotActivatedAt = &at
+	user.BotTrigger = match.Kind + ":" + match.Trigger
+
+	if opened {
+		p.event(ctx, domain.TraceEvent{TraceID: in.TraceID, UserID: user.ID, MessageID: messageID,
+			Stage: StageSessionOpened, Decision: domain.DecisionOK, Reason: SessionReasonActivated,
+			Detail: repository.Detail(map[string]any{
+				"kind": match.Kind, "trigger": match.Trigger,
+			})})
+		log.Info("customer session activated",
+			zap.String("kind", match.Kind),
+			zap.String("trigger", match.Trigger))
+	}
+	return SessionReasonActivated, true
 }
 
 func (p *Pipeline) whatsappBotEnabled(ctx context.Context, log *zap.Logger) bool {

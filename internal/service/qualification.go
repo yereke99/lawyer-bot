@@ -41,6 +41,7 @@ type Pipeline struct {
 	composer *Composer
 	qualify  *Qualifier
 	triggers *TriggerSet
+	activate *Activation
 	log      *zap.Logger
 
 	// CRM collaborators. They are optional so the pipeline stays testable in
@@ -76,15 +77,16 @@ type PipelineDeps struct {
 	Trace    *repository.TraceRepository
 	Settings *repository.SettingsRepository
 
-	AI       domain.AIClient
-	Agent    domain.AIReplyClient
-	WhatsApp domain.WhatsAppClient
-	Gate     *Gate
-	Catalog  *Catalog
-	Composer *Composer
-	Qualify  *Qualifier
-	Triggers *TriggerSet
-	Logger   *zap.Logger
+	AI         domain.AIClient
+	Agent      domain.AIReplyClient
+	WhatsApp   domain.WhatsAppClient
+	Gate       *Gate
+	Catalog    *Catalog
+	Composer   *Composer
+	Qualify    *Qualifier
+	Triggers   *TriggerSet
+	Activation *Activation
+	Logger     *zap.Logger
 
 	Clients  *repository.CRMRepository
 	FollowUp *FollowUpService
@@ -112,6 +114,19 @@ func NewPipeline(deps PipelineDeps, cfg PipelineConfig) *Pipeline {
 			agent = replyClient
 		}
 	}
+	if cfg.DryRun && deps.Sender != nil && !deps.Sender.DryRun() {
+		// DRY_RUN is the emergency brake. If the two halves disagree, messages
+		// would still leave the server while the log claimed otherwise.
+		log.Error("DRY_RUN is set for the pipeline but not for the outbound layer; " +
+			"automatic replies would still be delivered")
+	}
+	activate := deps.Activation
+	if activate == nil {
+		// Without an explicit configuration the deterministic legal-service
+		// triggers are what opens a session, which is the behaviour the
+		// business already relies on.
+		activate = NewActivation(nil, deps.Triggers, false)
+	}
 	return &Pipeline{
 		users:    deps.Users,
 		messages: deps.Messages,
@@ -127,6 +142,7 @@ func NewPipeline(deps PipelineDeps, cfg PipelineConfig) *Pipeline {
 		composer: deps.Composer,
 		qualify:  deps.Qualify,
 		triggers: deps.Triggers,
+		activate: activate,
 		log:      log,
 		clients:  deps.Clients,
 		follow:   deps.FollowUp,
@@ -224,6 +240,11 @@ func (p *Pipeline) Handle(ctx context.Context, in domain.InboundMessage) error {
 		return fmt.Errorf("upsert user: %w", err)
 	}
 	log = log.With(zap.Int64("user_id", user.ID), zap.String("state", string(user.CurrentState)))
+	if user.CreatedAt.Equal(user.UpdatedAt) {
+		log.Info("crm contact created")
+	} else {
+		log.Debug("crm contact loaded", zap.Bool("session_active", user.BotSessionActive()))
+	}
 	p.event(ctx, domain.TraceEvent{TraceID: in.TraceID, UserID: user.ID,
 		Stage: domain.StageUserUpserted, Decision: domain.DecisionOK,
 		Detail: repository.Detail(map[string]any{
@@ -324,6 +345,20 @@ func (p *Pipeline) Handle(ctx context.Context, in domain.InboundMessage) error {
 		}
 	}
 
+	// ------------------------------------------ 3b. funnel session gate
+	// The rule that the assistant never speaks first. Everything below this
+	// point only ever runs for a contact who wrote an activation trigger to us
+	// themselves, in a private chat.
+	if reason, open := p.sessionGate(ctx, log, user, in, messageID); !open {
+		if err := p.messages.MarkProcessed(ctx, messageID, false, "", 0, false); err != nil {
+			log.Warn("mark message processed failed", zap.Error(err))
+		}
+		p.event(ctx, domain.TraceEvent{TraceID: in.TraceID, UserID: user.ID, MessageID: messageID,
+			Stage: domain.StagePipelineDone, Decision: domain.DecisionSilent,
+			Reason: reason, DurationMS: time.Since(started).Milliseconds()})
+		return nil
+	}
+
 	// ------------------------------------------- 4. context for this decision
 	facts, err := p.trace.Facts(ctx, user.ID)
 	if err != nil {
@@ -347,10 +382,11 @@ func (p *Pipeline) Handle(ctx context.Context, in domain.InboundMessage) error {
 
 	// ------------------------------------------------- 5. gate: spend tokens?
 	gateResult := p.gate.Evaluate(GateInput{
-		Text:         in.Content(),
-		MessageType:  in.MessageType,
-		State:        user.CurrentState,
-		AICallsToday: aiCallsToday,
+		Text:          in.Content(),
+		MessageType:   in.MessageType,
+		State:         user.CurrentState,
+		AICallsToday:  aiCallsToday,
+		SessionActive: true,
 	})
 	gateDecision := domain.DecisionSkipAI
 	if gateResult.CallAI {
@@ -380,6 +416,7 @@ func (p *Pipeline) Handle(ctx context.Context, in domain.InboundMessage) error {
 	// ------------------------------------------------------- 7. decide
 	knownService := user.DetectedService
 	decision := ShouldRespond(DecisionInput{
+		SessionActive:       true,
 		TriggerMatched:      gateResult.Trigger.Matched,
 		Trigger:             gateResult.Trigger,
 		AICalled:            gateResult.CallAI,
@@ -490,6 +527,7 @@ func (p *Pipeline) classify(ctx context.Context, log *zap.Logger, user *domain.U
 	p.event(ctx, domain.TraceEvent{TraceID: in.TraceID, UserID: user.ID, MessageID: messageID,
 		Stage: domain.StageAIRequested, Decision: domain.DecisionCallAI,
 		Detail: repository.Detail(map[string]any{"history_messages": len(history)})})
+	log.Info("llm classification started", zap.Int("history_messages", len(history)))
 
 	result, err := p.ai.ClassifyMessage(ctx, domain.AIInput{
 		Text:            in.Content(),
@@ -549,14 +587,27 @@ func (p *Pipeline) classify(ctx context.Context, log *zap.Logger, user *domain.U
 			"input_tokens":  result.InputTokens,
 			"output_tokens": result.OutputTokens,
 		})})
+	log.Info("llm classification received",
+		zap.String("intent", string(result.Intent)),
+		zap.Float64("confidence", result.Confidence),
+		zap.Int64("duration_ms", result.ProcessingTimeMS))
 	return result, false
 }
 
+// shouldGenerateAgentReply decides whether the model writes the wording.
+//
+// Inside a funnel session it always does: the customer is holding a real
+// conversation, and a template answer to their third message reads as a dead
+// end. The composer stays as the fallback when generation fails or is rejected.
 func (p *Pipeline) shouldGenerateAgentReply(gate GateResult, aiFailed bool) bool {
 	if !p.cfg.AgentReplies || p.agent == nil || aiFailed || !gate.CallAI {
 		return false
 	}
-	return gate.Trigger.Matched || gate.Reason == GateReasonActiveFlow
+	switch gate.Reason {
+	case GateReasonActiveFlow, GateReasonActiveSession:
+		return true
+	}
+	return gate.Trigger.Matched
 }
 
 func (p *Pipeline) generateAgentReply(ctx context.Context, log *zap.Logger, user *domain.User,
@@ -586,6 +637,9 @@ func (p *Pipeline) generateAgentReply(ctx context.Context, log *zap.Logger, user
 			"action":           string(decision.Action),
 			"service":          serviceCode,
 		})})
+	log.Info("llm reply generation started",
+		zap.Int("history_messages", len(history)),
+		zap.String("action", string(decision.Action)))
 
 	result, err := p.agent.GenerateReply(ctx, domain.AIReplyInput{
 		Text:              in.Content(),
@@ -655,6 +709,9 @@ func (p *Pipeline) generateAgentReply(ctx context.Context, log *zap.Logger, user
 			"input_tokens":  result.InputTokens,
 			"output_tokens": result.OutputTokens,
 		})})
+	log.Info("llm reply received",
+		zap.Int("chars", len([]rune(text))),
+		zap.Int64("duration_ms", result.ProcessingTimeMS))
 	return text, true
 }
 
@@ -688,9 +745,33 @@ func (p *Pipeline) history(ctx context.Context, log *zap.Logger, userID, current
 	return out
 }
 
-// send delivers the reply, stores it as an outgoing message and records the
-// delivery outcome.
+// send delivers the reply to this customer and only this customer.
+//
+// The recipient is always the chat the inbound message arrived from, carried on
+// the user record; no cached, default or campaign address can reach this call.
+// When the shared outbound layer is wired the reply goes through it, so an
+// automatic answer, a follow-up and a consultant's message are stored, paced,
+// audited and pushed to the CRM by exactly the same code.
 func (p *Pipeline) send(ctx context.Context, log *zap.Logger, user *domain.User, replyTo int64, traceID, text string) error {
+	if p.sender != nil {
+		if err := p.waitBeforeReply(ctx, log, user.ID, 0, traceID); err != nil {
+			p.event(ctx, domain.TraceEvent{TraceID: traceID, UserID: user.ID, MessageID: replyTo,
+				Stage: domain.StageReplyFailed, Decision: domain.DecisionError,
+				Reason: "reply delay cancelled", Detail: errDetail(err)})
+			return err
+		}
+		log.Info("whatsapp send started", zap.String("kind", domain.DeliveryKindReply))
+		_, err := p.sender.Send(ctx, Outbound{
+			UserID:    user.ID,
+			Recipient: user.WhatsAppUserID,
+			Sender:    domain.SenderAI,
+			Kind:      domain.DeliveryKindReply,
+			TraceID:   traceID,
+			Text:      text,
+		})
+		return err
+	}
+
 	outgoing := &domain.Message{
 		UserID:      user.ID,
 		TraceID:     traceID,

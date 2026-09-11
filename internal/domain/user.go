@@ -78,6 +78,19 @@ type User struct {
 	LastSeenAt      time.Time
 	CreatedAt       time.Time
 	UpdatedAt       time.Time
+
+	// BotActivatedAt is when this contact entered the funnel by sending the
+	// configured trigger themselves. Nil means they never did, and the
+	// assistant must stay silent. BotTrigger records what activated them.
+	BotActivatedAt *time.Time
+	BotTrigger     string
+}
+
+// BotSessionActive reports whether the assistant is allowed to hold an
+// automated conversation with this contact. It is the single backend answer to
+// "did this person opt in by writing the trigger first?".
+func (u *User) BotSessionActive() bool {
+	return u != nil && u.BotActivatedAt != nil && !u.BotActivatedAt.IsZero()
 }
 
 // UserFact is a single piece of structured information extracted from the

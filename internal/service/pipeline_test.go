@@ -290,8 +290,10 @@ func TestGreetingIsStoredButNeitherAnalysedNorAnswered(t *testing.T) {
 		t.Fatalf("incoming message should be stored, count=%d err=%v", count, err)
 	}
 
+	// The greeting stops at the funnel gate: the contact never sent a trigger,
+	// so the message is stored and traced and nothing else happens.
 	stages := h.stages(t, "trace-greet")
-	for _, want := range []string{domain.StageMessageStored, domain.StageGate, domain.StagePipelineDone} {
+	for _, want := range []string{domain.StageMessageStored, StageSessionGate, domain.StagePipelineDone} {
 		if !hasStage(stages, want) {
 			t.Errorf("trace is missing stage %q, got %v", want, stages)
 		}

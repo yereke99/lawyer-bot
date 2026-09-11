@@ -87,6 +87,9 @@ func (m *Messenger) OnSent(fn func(userID int64)) { m.notify = fn }
 // SupportsFiles reports whether the configured provider can send media.
 func (m *Messenger) SupportsFiles() bool { return m.files != nil }
 
+// DryRun reports whether this layer is stubbing out provider calls.
+func (m *Messenger) DryRun() bool { return m != nil && m.dryRun }
+
 // Outbound is one message to deliver to a client.
 type Outbound struct {
 	UserID    int64
@@ -202,23 +205,25 @@ func (m *Messenger) Send(ctx context.Context, out Outbound) (SendResult, error) 
 		return SendResult{MessageID: messageID, ProviderID: "dry-run"}, nil
 	}
 
-	var (
-		res      domain.SendResult
-		sendErr  error
-		provider = "text"
-	)
+	provider := "text"
+	transmit := func() (domain.SendResult, error) {
+		return m.wa.SendText(ctx, out.Recipient, out.Text)
+	}
 	if out.MediaPath != "" {
 		provider = "file"
-		res, sendErr = m.files.SendFile(ctx, out.Recipient, domain.OutgoingFile{
-			Path:     out.MediaPath,
-			FileName: out.MediaName,
-			MimeType: out.MediaMime,
-			Caption:  out.Text,
-			Type:     msgType,
-		})
-	} else {
-		res, sendErr = m.wa.SendText(ctx, out.Recipient, out.Text)
+		transmit = func() (domain.SendResult, error) {
+			return m.files.SendFile(ctx, out.Recipient, domain.OutgoingFile{
+				Path:     out.MediaPath,
+				FileName: out.MediaName,
+				MimeType: out.MediaMime,
+				Caption:  out.Text,
+				Type:     msgType,
+			})
+		}
 	}
+
+	res, attempts, sendErr := m.transmit(ctx, log, transmit)
+	delivery.Attempts = attempts
 
 	if sendErr != nil {
 		delivery.Status = domain.DeliveryFailed
@@ -261,6 +266,64 @@ func (m *Messenger) Send(ctx context.Context, out Outbound) (SendResult, error) 
 	})
 	log.Info("message sent", zap.String("transport", provider), logger.Preview("text", out.Text))
 	return SendResult{MessageID: messageID, ProviderID: res.MessageID}, nil
+}
+
+// maxSendAttempts bounds how many times one already-composed message is offered
+// to the provider. Retrying transport is safe and cheap; regenerating the text
+// is neither, so the model is never called again for a delivery failure.
+const maxSendAttempts = 3
+
+// sendRetryBackoff is the pause between transport attempts.
+const sendRetryBackoff = 900 * time.Millisecond
+
+// transmit hands one composed message to the provider, retrying only errors the
+// provider itself reports as transient. It returns the number of attempts made.
+func (m *Messenger) transmit(ctx context.Context, log *zap.Logger,
+	call func() (domain.SendResult, error)) (domain.SendResult, int, error) {
+
+	var (
+		res domain.SendResult
+		err error
+	)
+	for attempt := 1; attempt <= maxSendAttempts; attempt++ {
+		res, err = call()
+		if err == nil {
+			return res, attempt, nil
+		}
+		if !retryableSendError(err) || attempt == maxSendAttempts {
+			return res, attempt, err
+		}
+		log.Warn("whatsapp send failed, retrying the same message",
+			zap.Int("attempt", attempt), zap.Error(err))
+
+		timer := time.NewTimer(sendRetryBackoff)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return res, attempt, err
+		case <-timer.C:
+		}
+	}
+	return res, maxSendAttempts, err
+}
+
+// retryableSendError reports whether another attempt could succeed. A provider
+// error type that knows the answer is trusted; anything else is treated as
+// permanent so a rejected message is never hammered at the API.
+func retryableSendError(err error) bool {
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return false
+	}
+	if errors.Is(err, domain.ErrWhatsAppGroupChat) || errors.Is(err, domain.ErrWhatsAppNonPrivateChat) {
+		return false
+	}
+	var retryable interface{ Retryable() bool }
+	if errors.As(err, &retryable) {
+		return retryable.Retryable()
+	}
+	// A transport-level failure (connection reset, DNS blip) surfaces as a
+	// plain wrapped error and is worth one more attempt.
+	return true
 }
 
 // SendRaw delivers a message to an address that is not a CRM client, such as

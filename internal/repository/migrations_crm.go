@@ -54,6 +54,10 @@ var crmColumns = []addColumn{
 	{"users", "tags", "TEXT NOT NULL DEFAULT ''"},
 	{"users", "language_locked", "INTEGER NOT NULL DEFAULT 0"},
 	{"users", "summary_watermark", "INTEGER NOT NULL DEFAULT 0"},
+	// Funnel activation. A NULL bot_activated_at means the contact has never
+	// sent the configured trigger, and the assistant must stay silent.
+	{"users", "bot_activated_at", "DATETIME"},
+	{"users", "bot_trigger", "TEXT NOT NULL DEFAULT ''"},
 
 	// ------------------------------------------------------------- messages
 	{"messages", "sender_type", "TEXT NOT NULL DEFAULT ''"},
@@ -178,6 +182,7 @@ var crmIndexes = []string{
 	`CREATE INDEX IF NOT EXISTS idx_users_last_inbound  ON users(last_inbound_at)`,
 	`CREATE INDEX IF NOT EXISTS idx_users_next_followup ON users(next_follow_up_at)`,
 	`CREATE INDEX IF NOT EXISTS idx_users_language      ON users(language)`,
+	`CREATE INDEX IF NOT EXISTS idx_users_bot_activated ON users(bot_activated_at)`,
 	`CREATE INDEX IF NOT EXISTS idx_messages_sender     ON messages(sender_type)`,
 	`CREATE INDEX IF NOT EXISTS idx_messages_user_dir   ON messages(user_id, direction, created_at)`,
 }
@@ -206,6 +211,16 @@ var crmBackfill = []string{
 	`UPDATE users SET last_outbound_at = (
 		SELECT MAX(created_at) FROM messages m WHERE m.user_id = users.id AND m.direction = 'outgoing')
 	 WHERE last_outbound_at IS NULL`,
+
+	// A conversation the assistant has already answered is in the funnel. Without
+	// this the activation gate would silence every live production conversation
+	// the moment it ships.
+	`UPDATE users SET bot_activated_at = (
+		SELECT MIN(created_at) FROM messages m WHERE m.user_id = users.id AND m.direction = 'outgoing')
+	 WHERE bot_activated_at IS NULL
+	   AND EXISTS (SELECT 1 FROM messages m WHERE m.user_id = users.id AND m.direction = 'outgoing')`,
+	`UPDATE users SET bot_trigger = 'migrated_existing_conversation'
+	 WHERE bot_trigger = '' AND bot_activated_at IS NOT NULL`,
 }
 
 // MigrateCRM applies the CRM migration on top of the existing schema.

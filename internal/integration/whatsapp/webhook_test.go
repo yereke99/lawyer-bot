@@ -222,6 +222,50 @@ func TestParseGreenAPINonIncomingEventYieldsNoMessages(t *testing.T) {
 	}
 }
 
+// Case E — everything this account sends itself comes back as an outgoing
+// event. None of it may ever be read as customer input, or the assistant would
+// answer the consultant and then answer its own answer.
+func TestOwnOutgoingEventsAreNeverCustomerInput(t *testing.T) {
+	for _, kind := range []string{
+		"outgoingMessageReceived",
+		"outgoingAPIMessageReceived",
+		"outgoingMessageStatus",
+		"stateInstanceChanged",
+	} {
+		body := []byte(`{"typeWebhook":"` + kind + `","idMessage":"echo-1",
+			"senderData":{"chatId":"77015551234@c.us","sender":"77015551234@c.us"},
+			"messageData":{"typeMessage":"textMessage","textMessageData":{"textMessage":"Здравствуйте, это Диана"}}}`)
+
+		got, err := ParseWebhook(body)
+		if err != nil {
+			t.Fatalf("parse %s: %v", kind, err)
+		}
+		if len(got) != 0 {
+			t.Fatalf("%s must not produce customer input, got %d message(s)", kind, len(got))
+		}
+		if IsInboundEventKind(EventKind(body)) {
+			t.Fatalf("%s must not be classified as inbound", kind)
+		}
+	}
+}
+
+// Defence in depth: even an incoming event whose sender is our own number is
+// our own message and must be dropped.
+func TestIncomingEventFromOurOwnNumberIsDropped(t *testing.T) {
+	body := []byte(`{"typeWebhook":"incomingMessageReceived","idMessage":"self-1",
+		"instanceData":{"wid":"77001112233@c.us"},
+		"senderData":{"chatId":"77001112233@c.us","sender":"77001112233@c.us"},
+		"messageData":{"typeMessage":"textMessage","textMessageData":{"textMessage":"тест"}}}`)
+
+	got, err := ParseWebhook(body)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("a message from our own number must be dropped, got %d", len(got))
+	}
+}
+
 func TestMalformedPayloadIsRejected(t *testing.T) {
 	if _, err := ParseWebhook([]byte(`{not json`)); err == nil {
 		t.Fatal("malformed JSON should return an error")

@@ -512,6 +512,7 @@ func (a *API) clientSummary(c *domain.CRMClient) map[string]any {
 		"next_follow_up":  c.NextFollowUpAt,
 		"created_at":      c.User.CreatedAt,
 		"needs_human":     c.CRMStatus == domain.CRMNeedsConsultant,
+		"bot_active":      c.BotSessionActive(),
 	}
 }
 
@@ -536,6 +537,8 @@ func (a *API) clientDetail(r *http.Request, c *domain.CRMClient) map[string]any 
 	detail["follow_up_stage"] = c.FollowUpStage
 	detail["language_locked"] = c.LanguageLocked
 	detail["lead_score"] = c.LeadScore
+	detail["bot_activated_at"] = c.BotActivatedAt
+	detail["bot_trigger"] = c.BotTrigger
 
 	if job, err := a.jobs.NextPendingForUser(r.Context(), c.ID); err == nil {
 		detail["next_follow_up_job"] = map[string]any{

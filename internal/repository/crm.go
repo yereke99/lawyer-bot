@@ -33,6 +33,7 @@ const crmClientColumns = `u.id, u.whatsapp_user_id, u.phone_number, u.display_na
 	u.last_inbound_at, u.last_outbound_at, u.unread_count, u.ai_summary, u.important_facts,
 	u.next_action, u.qualification_stage, u.ai_confidence, u.intent, u.follow_up_stage,
 	u.next_follow_up_at, u.close_reason, u.tags, u.language_locked, u.summary_watermark,
+	u.bot_activated_at, u.bot_trigger,
 	COALESCE(a.name, '')`
 
 const crmClientFrom = ` FROM users u LEFT JOIN admin_users a ON a.id = u.assigned_admin_id`
@@ -308,6 +309,7 @@ func scanCRMClient(rows *sql.Rows) (domain.CRMClient, error) {
 		nextFollowUpAt sql.NullTime
 		tags           string
 		langLocked     int
+		botActivated   sql.NullTime
 	)
 	err := rows.Scan(
 		&c.ID, &c.WhatsAppUserID, &c.PhoneNumber, &c.DisplayName, &lang,
@@ -318,6 +320,7 @@ func scanCRMClient(rows *sql.Rows) (domain.CRMClient, error) {
 		&lastInbound, &lastOutbound, &c.UnreadCount, &c.AISummary, &facts,
 		&c.NextAction, &c.QualificationStage, &c.AIConfidence, &c.Intent, &c.FollowUpStage,
 		&nextFollowUpAt, &c.CloseReason, &tags, &langLocked, &c.SummaryWatermark,
+		&botActivated, &c.BotTrigger,
 		&c.AssignedAdminName)
 	if err != nil {
 		return c, fmt.Errorf("scan crm client: %w", err)
@@ -338,6 +341,7 @@ func scanCRMClient(rows *sql.Rows) (domain.CRMClient, error) {
 	c.LastInboundAt = nullTime(lastInbound)
 	c.LastOutboundAt = nullTime(lastOutbound)
 	c.NextFollowUpAt = nullTime(nextFollowUpAt)
+	c.BotActivatedAt = nullTime(botActivated)
 	return c, nil
 }
 

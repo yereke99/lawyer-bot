@@ -20,11 +20,21 @@ func newCRMTestDB(t *testing.T) (*DB, *CRMRepository, *UserRepository) {
 	return db, NewCRMRepository(db), NewUserRepository(db)
 }
 
+// mustClient creates a contact that already entered the funnel, which is what
+// every client a consultant works with in the CRM looks like.
 func mustClient(t *testing.T, users *UserRepository, waID, phone, name string) *domain.User {
 	t.Helper()
-	u, err := users.Upsert(context.Background(), waID, phone, name)
+	ctx := context.Background()
+	u, err := users.Upsert(ctx, waID, phone, name)
 	if err != nil {
 		t.Fatalf("create client: %v", err)
+	}
+	if _, err := users.ActivateBotSession(ctx, u.ID, "test", time.Now().UTC()); err != nil {
+		t.Fatalf("activate bot session: %v", err)
+	}
+	u, err = users.GetByID(ctx, u.ID)
+	if err != nil {
+		t.Fatalf("reload client: %v", err)
 	}
 	return u
 }

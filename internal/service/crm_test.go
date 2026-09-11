@@ -75,41 +75,51 @@ func newCRMHarness(t *testing.T, ai *stubAI, followCfg FollowUpConfig) *crmHarne
 		Catalog: catalog, Logger: zap.NewNop(),
 	})
 
+	h := &crmHarness{
+		harness: base, clients: clients, jobs: jobs, adminRepo: adminRepo,
+		notes: notes, audit: audit, messenger: messenger, follow: follow,
+		crm: crm, auth: auth, hub: hub,
+	}
 	// Rebuild the pipeline with the CRM collaborators attached.
+	h.rebuildPipeline(t, ai, nil)
+	return h
+}
+
+// rebuildPipeline wires the pipeline exactly as main.go does. A nil activation
+// falls back to the deterministic legal-service triggers, which is the shipped
+// default.
+func (h *crmHarness) rebuildPipeline(t *testing.T, ai *stubAI, activation *Activation) {
+	t.Helper()
+	catalog := NewCatalog()
 	triggers := NewTriggerSet()
-	base.pipeline = NewPipeline(PipelineDeps{
-		Users:    base.users,
-		Messages: base.messages,
-		Leads:    base.leads,
-		AILog:    repository.NewAIInteractionRepository(base.db),
-		Trace:    base.trace,
-		Settings: base.settings,
+	h.pipeline = NewPipeline(PipelineDeps{
+		Users:    h.users,
+		Messages: h.messages,
+		Leads:    h.leads,
+		AILog:    repository.NewAIInteractionRepository(h.db),
+		Trace:    h.trace,
+		Settings: h.settings,
 		AI:       ai,
-		WhatsApp: base.wa,
+		WhatsApp: h.wa,
 		Gate: NewGate(triggers, GateConfig{
 			MaxCallsPerDay: 40, AnalyzeUnmatched: true, MinWordsUnmatched: 3,
 		}),
-		Catalog:  catalog,
-		Composer: NewComposer(catalog),
-		Qualify:  NewQualifier(catalog, testMinConfidence),
-		Triggers: triggers,
-		Logger:   zap.NewNop(),
-		Clients:  clients,
-		FollowUp: follow,
-		Sender:   messenger,
-		Notify:   hub.ClientChanged,
+		Catalog:    catalog,
+		Composer:   NewComposer(catalog),
+		Qualify:    NewQualifier(catalog, testMinConfidence),
+		Triggers:   triggers,
+		Activation: activation,
+		Logger:     zap.NewNop(),
+		Clients:    h.clients,
+		FollowUp:   h.follow,
+		Sender:     h.messenger,
+		Notify:     h.hub.ClientChanged,
 	}, PipelineConfig{
 		MinConfidence:   testMinConfidence,
 		ContextMessages: 10,
 		NotifyRecipient: dianaPhone,
 		DefaultSource:   domain.SourceWhatsApp,
 	})
-
-	return &crmHarness{
-		harness: base, clients: clients, jobs: jobs, adminRepo: adminRepo,
-		notes: notes, audit: audit, messenger: messenger, follow: follow,
-		crm: crm, auth: auth, hub: hub,
-	}
 }
 
 func testFollowUpConfig() FollowUpConfig {

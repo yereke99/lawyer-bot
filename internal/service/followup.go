@@ -352,6 +352,8 @@ func (s *FollowUpService) blocked(ctx context.Context, client *domain.CRMClient,
 		return "whatsapp bot disabled", false
 	case !domain.IsPrivateWhatsAppChat(client.WhatsAppUserID):
 		return "non-private whatsapp chat", false
+	case !client.BotSessionActive():
+		return "no active bot session", false
 	case client.Blocked:
 		return "client is blocked", false
 	case !client.AIEnabled:

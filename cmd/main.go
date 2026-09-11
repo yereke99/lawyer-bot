@@ -134,6 +134,10 @@ func run() error {
 	// ------------------------------------------------------------ services
 	catalog := service.NewCatalog()
 	triggers := service.NewTriggerSet()
+	activation := service.NewActivation(cfg.BotActivationTriggers, triggers, cfg.BotActivationStrict)
+	log.Info("funnel activation configured",
+		zap.Int("activation_phrases", len(activation.Phrases())),
+		zap.Bool("strict", activation.Strict()))
 	gate := service.NewGate(triggers, service.GateConfig{
 		MaxCallsPerDay:    cfg.AIMaxCallsPerDay,
 		AnalyzeUnmatched:  cfg.AIAnalyzeUnmatched,
@@ -176,25 +180,26 @@ func run() error {
 	})
 
 	pipeline := service.NewPipeline(service.PipelineDeps{
-		Users:    users,
-		Messages: messages,
-		Leads:    leads,
-		AILog:    aiLog,
-		Trace:    trace,
-		Settings: settings,
-		AI:       aiClient,
-		WhatsApp: waClient,
-		Gate:     gate,
-		Catalog:  catalog,
-		Composer: service.NewComposer(catalog),
-		Qualify:  service.NewQualifier(catalog, cfg.AIMinConfidence),
-		Triggers: triggers,
-		Logger:   log,
-		Clients:  crmClients,
-		FollowUp: followUps,
-		Media:    mediaStore,
-		Sender:   messenger,
-		Notify:   hub.ClientChanged,
+		Users:      users,
+		Messages:   messages,
+		Leads:      leads,
+		AILog:      aiLog,
+		Trace:      trace,
+		Settings:   settings,
+		AI:         aiClient,
+		WhatsApp:   waClient,
+		Gate:       gate,
+		Catalog:    catalog,
+		Composer:   service.NewComposer(catalog),
+		Qualify:    service.NewQualifier(catalog, cfg.AIMinConfidence),
+		Triggers:   triggers,
+		Activation: activation,
+		Logger:     log,
+		Clients:    crmClients,
+		FollowUp:   followUps,
+		Media:      mediaStore,
+		Sender:     messenger,
+		Notify:     hub.ClientChanged,
 	}, service.PipelineConfig{
 		MinConfidence:   cfg.AIMinConfidence,
 		ContextMessages: cfg.OpenAIContextMessages,
@@ -212,7 +217,7 @@ func run() error {
 		QueueSize: cfg.QueueSize,
 		// One job must outlive a slow OpenAI call, reply pacing and the
 		// WhatsApp send.
-		JobTimeout: cfg.OpenAITimeout() + cfg.WhatsAppReplyDelayMax + cfg.WhatsAppTimeout() + 15*time.Second,
+		JobTimeout: cfg.OpenAITimeout() + cfg.WhatsAppReplyDelayMax + 3*cfg.WhatsAppTimeout() + 15*time.Second,
 		Logger:     log,
 	})
 	pool.Start(context.WithoutCancel(ctx))

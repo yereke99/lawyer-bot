@@ -305,11 +305,15 @@ type CRMClient struct {
 
 // AutomationAllowed reports whether the assistant may answer this client.
 // Every automatic send path in the application funnels through this method.
+//
+// A contact who never opened a funnel session is never eligible: the assistant
+// must not be the one who speaks first, and that includes follow-ups.
 func (c *CRMClient) AutomationAllowed() bool {
 	if c == nil {
 		return false
 	}
-	return !c.Blocked &&
+	return c.BotSessionActive() &&
+		!c.Blocked &&
 		c.AIEnabled &&
 		c.Mode.AutomationAllowed() &&
 		!c.CRMStatus.OrDefault().Terminal()

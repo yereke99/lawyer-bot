@@ -52,6 +52,7 @@ const (
 	GateReasonBudgetExceeded  = "ai_budget_exceeded"
 	GateReasonTriggerMatched  = "trigger_matched"
 	GateReasonActiveFlow      = "active_qualification_flow"
+	GateReasonActiveSession   = "active_customer_session"
 	GateReasonOffTopic        = "off_topic"
 	GateReasonSmallTalkOnly   = "small_talk_only"
 	GateReasonTooShort        = "unmatched_and_too_short"
@@ -61,10 +62,15 @@ const (
 
 // GateInput is everything the pre-filter needs.
 type GateInput struct {
-	Text         string
-	MessageType  domain.MessageType
-	State        domain.ConversationState
+	Text        string
+	MessageType domain.MessageType
+	State       domain.ConversationState
+	// AICallsToday is the per-user spend so far today.
 	AICallsToday int
+	// SessionActive is true once the customer has entered the funnel with the
+	// configured trigger. Their later messages are answers to the assistant's
+	// own questions, so the keyword filters below must not silence them.
+	SessionActive bool
 }
 
 // GateResult is the pre-filter verdict.
@@ -97,6 +103,13 @@ func (g *Gate) Evaluate(in GateInput) GateResult {
 	// "Здравствуйте, нужен юрист" is a lead, not small talk.
 	if trigger.Matched {
 		return GateResult{CallAI: true, Reason: GateReasonTriggerMatched, Trigger: trigger}
+	}
+
+	// Inside a funnel session the customer is talking to the assistant. "Да",
+	// "в Алматы" and "спасибо" carry no keyword but are the conversation, so
+	// the keyword filters below are skipped entirely.
+	if in.SessionActive {
+		return GateResult{CallAI: true, Reason: GateReasonActiveSession, Trigger: trigger}
 	}
 
 	// Chit-chat never reaches the model, in any state.

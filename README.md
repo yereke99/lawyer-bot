@@ -32,39 +32,82 @@ Five rules are enforced by the architecture, not just by the prompt:
    `statemachine.go` validates the value and the transition against what the
    database holds. Terminal statuses are human decisions only.
 
+## The assistant never writes first
+
+The number is also used by people. Nobody is contacted, answered or enrolled by
+automation until they send an activation trigger to it themselves.
+
+```
+inbound event
+   |
+   +-- our own outgoing / status event ---> ignore
+   +-- group or broadcast chat ------------> ignore
+   |
+   v
+private inbound message  (stored and traced either way)
+   |
+   +-- funnel session open? --- yes ------> process with the model
+   |
+   no
+   |
+   +-- matches an activation trigger? -- no ---> ignore, stay silent
+                                        |
+                                       yes
+                                        v
+                              open the session, then process
+```
+
+The session is a column on the client record (`users.bot_activated_at`), so it
+survives restarts and is visible in the CRM. It is opened once: a repeated
+trigger never restarts a running conversation. Once open, every later private
+message from that customer goes to the model, including short answers with no
+keyword in them.
+
+`BOT_ACTIVATION_TRIGGERS` configures the phrases, separated by `|`. Matching
+folds away case, punctuation, repeated spaces and line breaks, but the whole
+phrase must be present. `BOT_ACTIVATION_STRICT=true` narrows activation to those
+phrases alone; left false, a clear legal-service keyword also opens a session,
+which is the behaviour the business already relies on.
+
 ## Pipeline
 
 ```
-green polling/webhook -> store -> crm gate -> gate -> classify -> state machine -> decide -> agent/template -> reply -> qualify -> follow-up
-                         |          |          |        |            |              |          |               |         |          |
-                      always    blocked?     free    OpenAI      validated       Go rules   OpenAI or      WhatsApp  to Diana   durable job
-                                human?                                                      safe fallback
+green polling/webhook -> store -> crm gate -> session gate -> gate -> classify -> state machine -> decide -> agent/template -> reply -> qualify -> follow-up
+                         |          |            |             |        |            |              |          |               |         |          |
+                      always    blocked?     in funnel?      free    OpenAI      validated       Go rules   OpenAI or      WhatsApp  to Diana   durable job
+                                human?                                                                      safe fallback
 ```
 
 Inbound transport is unchanged: Green API **native polling**, no incoming
 webhook. The CRM's own live updates use SSE between the browser and this server,
 which is a separate concern from how WhatsApp messages arrive.
 
+Every outgoing message — an automatic answer, a follow-up and a consultant's
+manual reply — leaves through `internal/service/outbound.go`. It holds the
+per-chat send lock, the delivery audit trail, the CRM activity timestamps and a
+bounded retry of the transport. A delivery failure retries the message that was
+already generated; the model is never called a second time for it.
+
 The **gate** (`internal/service/gate.go`) is the token budget guard. It runs
-before any OpenAI call:
+after the session gate and before any OpenAI call:
 
-| Message                       | State      | Model called | Reply |
-|-------------------------------|------------|--------------|-------|
-| `Здравствуйте`                | new        | no           | no    |
-| `Как дела?`                   | any        | no           | no    |
-| `Какая погода?`               | qualifying | no           | no    |
-| `Какие у вас услуги?`         | new        | yes          | yes   |
-| `Здравствуйте, нужен юрист`   | new        | yes          | yes   |
-| `Уже работает`                | qualifying | yes          | yes   |
-| image with no caption         | any        | no           | no    |
+| Message                       | In funnel | Model called | Reply |
+|-------------------------------|-----------|--------------|-------|
+| `Привет`                      | no        | no           | no    |
+| `Ты где?`                     | no        | no           | no    |
+| activation trigger            | no        | yes          | yes   |
+| `Какие у вас услуги?`         | no        | yes*         | yes*  |
+| `Иә, рахмет`                  | yes       | yes          | yes   |
+| `Какая погода?`               | yes       | yes          | yes   |
+| image with no caption         | either    | no           | no    |
 
-Small talk costs zero tokens. A trigger match always earns analysis, even next
-to a greeting. Inside an active qualification flow, short answers are analysed
-because they are answers to the bot's own question.
+\* unless `BOT_ACTIVATION_STRICT=true`.
 
-Set `AI_ANALYZE_UNMATCHED=false` for the strictest possible token saving: then
-only messages that match a legal trigger or continue an active flow reach the
-model.
+Outside the funnel nothing costs tokens and nothing is answered. Inside it the
+customer is holding a conversation, so their messages are not filtered by
+keyword heuristics — dropping them is what leaves a customer talking to silence.
+
+`AI_ANALYZE_UNMATCHED` applies only inside an open session.
 
 ## Pricing
 
@@ -179,7 +222,14 @@ GREEN_API_TOKEN_INSTANCE=...
 GREEN_API_API_URL=https://api.green-api.com
 GREEN_API_POLLING_ENABLED=true
 LLM_AGENT_REPLIES=true
+BOT_ACTIVATION_TRIGGERS=Сәлеметсіз бе! Тауар белгісін тіркегім келеді
 ```
+
+Green API delivers this account's own sends back as `outgoingMessageReceived`
+and `outgoingAPIMessageReceived`. Only `incomingMessageReceived` is treated as
+customer input, and an incoming event whose sender is this instance's own WhatsApp
+ID is dropped as well, so a consultant's message can never be read as a customer
+message and answered.
 
 If the Green API instance has a custom webhook URL configured, clear it in the
 Green API cabinet before using `receiveNotification`, otherwise Green API
@@ -221,6 +271,15 @@ interfaces with stub implementations. The suite covers trigger matching, the
 token gate, the response decision engine, lead qualification, reply generation
 and price protection, phone normalisation, repositories, webhook parsing,
 signature verification and the end-to-end pipeline including the Diana handoff.
+
+`internal/service/funnel_test.go` covers the routing rules the business depends
+on: an unrelated private message before the trigger is silent and costs nothing,
+the trigger opens a session and the first answer really reaches the customer's
+own chat, a later message with no keyword continues the dialogue with history, a
+group never activates anything, a duplicate delivery answers once, two customers
+stay isolated, a failed send preserves the generated reply without re-running the
+model, a consultant's reply stops the assistant, and the outbound layer refuses
+groups and broadcast lists.
 
 The CRM adds coverage for: migration idempotency on a database that already
 holds production rows, client lookup and de-duplication, human takeover under

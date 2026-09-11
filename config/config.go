@@ -34,6 +34,11 @@ type Config struct {
 	OpenAIMaxInputChars   int
 	LLMAgentReplies       bool
 
+	// Funnel activation. A contact becomes eligible for automated conversation
+	// only by sending one of these phrases to the number themselves.
+	BotActivationTriggers []string
+	BotActivationStrict   bool
+
 	// AI decision thresholds and token budget
 	AIMinConfidence     float64
 	AIMaxCallsPerDay    int
@@ -136,6 +141,9 @@ func Load() (*Config, error) {
 		OpenAITimeoutSeconds:  getenvInt("OPENAI_TIMEOUT_SECONDS", 20),
 		OpenAIMaxInputChars:   getenvInt("OPENAI_MAX_INPUT_CHARS", 1200),
 		LLMAgentReplies:       getenvBool("LLM_AGENT_REPLIES", true),
+
+		BotActivationTriggers: getenvList("BOT_ACTIVATION_TRIGGERS", defaultActivationTriggers),
+		BotActivationStrict:   getenvBool("BOT_ACTIVATION_STRICT", false),
 
 		AIMinConfidence:     getenvFloat("AI_MIN_CONFIDENCE", 0.75),
 		AIMaxCallsPerDay:    getenvInt("AI_MAX_CALLS_PER_USER_PER_DAY", 40),
@@ -260,6 +268,9 @@ func (c *Config) Validate() error {
 	}
 	if c.SQLitePath == "" {
 		problems = append(problems, "SQLITE_PATH is required")
+	}
+	if c.BotActivationStrict && len(c.BotActivationTriggers) == 0 {
+		problems = append(problems, "BOT_ACTIVATION_TRIGGERS must list at least one phrase when BOT_ACTIVATION_STRICT is true")
 	}
 	if c.AIMinConfidence < 0 || c.AIMinConfidence > 1 {
 		problems = append(problems, "AI_MIN_CONFIDENCE must be between 0 and 1")
@@ -436,6 +447,32 @@ func (c *Config) FollowUpLocation() *time.Location {
 		return time.UTC
 	}
 	return loc
+}
+
+// defaultActivationTriggers is the funnel entry phrase the campaigns hand out.
+// Deployments override it with BOT_ACTIVATION_TRIGGERS.
+var defaultActivationTriggers = []string{
+	"Сәлеметсіз бе! Тауар белгісін тіркегім келеді",
+}
+
+// getenvList parses a "|"-separated list. The separator is a pipe rather than a
+// comma because activation phrases are whole sentences and may contain commas.
+func getenvList(key string, def []string) []string {
+	raw := strings.TrimSpace(os.Getenv(key))
+	if raw == "" {
+		return def
+	}
+	parts := strings.Split(raw, "|")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		if p = strings.TrimSpace(p); p != "" {
+			out = append(out, p)
+		}
+	}
+	if len(out) == 0 {
+		return def
+	}
+	return out
 }
 
 func getenvInt64Slice(key string) []int64 {
